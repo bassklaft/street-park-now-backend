@@ -75,10 +75,66 @@ function parseSignText(text) {
   return { days, time, raw: text };
 }
 
+// ─── GEOCODING PROXY ──────────────────────────────────────────────────────────
+// Proxies NYC Planning Labs geocoder — avoids CORS issues from browser
+app.get("/api/geocode", async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: "q required" });
+
+  const withCity = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island/i.test(q)
+    ? q : `${q}, New York City`;
+
+  try {
+    const url = `https://geosearch.planninglabs.nyc/v2/search?text=${encodeURIComponent(withCity)}&size=1&layers=address,street,venue,neighbourhood`;
+    const r = await fetch(url);
+    if (!r.ok) return res.status(502).json({ error: "Geocoder unavailable" });
+    const data = await r.json();
+    if (!data.features?.length) return res.status(404).json({ error: `Could not find "${q}" in NYC` });
+
+    const p = data.features[0].properties;
+    const [lng, lat] = data.features[0].geometry.coordinates;
+    res.json({
+      street: p.street || p.name || q.toUpperCase(),
+      borough: p.borough || p.county || "",
+      neighborhood: p.neighbourhood || p.locality || "",
+      label: p.label || q,
+      lat, lng,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reverse geocode — lat/lng to street name
+app.get("/api/reverse-geocode", async (req, res) => {
+  const { lat, lng } = req.query;
+  if (!lat || !lng) return res.status(400).json({ error: "lat and lng required" });
+
+  try {
+    const url = `https://geosearch.planninglabs.nyc/v2/reverse?point.lat=${lat}&point.lon=${lng}&size=1`;
+    const r = await fetch(url);
+    if (!r.ok) return res.status(502).json({ error: "Geocoder unavailable" });
+    const data = await r.json();
+    if (!data.features?.length) return res.status(404).json({ error: "Could not identify street" });
+
+    const p = data.features[0].properties;
+    res.json({
+      street: p.street || p.name || "",
+      borough: p.borough || "",
+      neighborhood: p.neighbourhood || p.locality || "",
+      label: p.label || "",
+      lat: parseFloat(lat),
+      lng: parseFloat(lng),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
-
-// ─── NYC DATA PROXY ENDPOINTS ─────────────────────────────────────────────────
 // These run server-side so there's no 403 CORS issue from the browser
 
 // Street cleaning schedule — searches DOT parking signs for a street name

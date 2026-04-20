@@ -1,0 +1,25 @@
+{
+  "name": "street-park-info-backend",
+  "version": "1.0.0",
+  "description": "Street Park Info — Backend API",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.12.0",
+    "stripe": "^16.12.0",
+    "twilio": "^5.3.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

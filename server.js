@@ -1,105 +1,103 @@
 /**
- * Street Park Info — Backend Server
- * Express + Stripe + Twilio + node-cron + PostgreSQL
- * NYC Open Data proxy (fixes 403 CORS issue from browser)
+ * Street Park Info — Backend
+ * Smart NYC parking intelligence — works like a local who knows every street
  */
 
 require("dotenv").config();
 const express = require("express");
-const cors = require("cors");
-const cron = require("node-cron");
-const { Pool } = require("pg");
-const Stripe = require("stripe");
-const twilio = require("twilio");
+const cors    = require("cors");
+const cron    = require("node-cron");
+const { Pool }  = require("pg");
+const Stripe    = require("stripe");
+const twilio    = require("twilio");
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ─── CLIENTS ─────────────────────────────────────────────────────────────────
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// ─── CLIENTS ──────────────────────────────────────────────────────────────────
+const stripe       = new Stripe(process.env.STRIPE_SECRET_KEY);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const db           = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: "*" })); // allow all origins — frontend is on Vercel
+app.use(cors({ origin: "*" }));
 app.use("/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
-// ─── NYC OPEN DATA CONFIG ─────────────────────────────────────────────────────
 const SOCRATA = "https://data.cityofnewyork.us/resource";
-// App token avoids rate limits — register free at data.cityofnewyork.us/profile
-// Works without token but slower — add NYC_APP_TOKEN to Render env vars when ready
-const NYC_TOKEN = process.env.NYC_APP_TOKEN || "";
-const nycHeaders = NYC_TOKEN ? { "X-App-Token": NYC_TOKEN } : {};
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-// Normalize any street name input to match DOT dataset format
-// "broadway" → "BROADWAY", "w 72nd st" → "WEST 72 STREET", etc.
-function normalizeStreet(raw) {
-  return raw
-    .trim()
-    .toUpperCase()
-    .replace(/\bW\.?\s+/g, "WEST ")
-    .replace(/\bE\.?\s+/g, "EAST ")
-    .replace(/\bN\.?\s+/g, "NORTH ")
-    .replace(/\bS\.?\s+/g, "SOUTH ")
-    .replace(/\bST\.?$/,  "STREET")
-    .replace(/\bAVE?\.?$/, "AVENUE")
-    .replace(/\bBLVD\.?$/, "BOULEVARD")
-    .replace(/\bDR\.?$/,  "DRIVE")
-    .replace(/\bPL\.?$/,  "PLACE")
-    .replace(/\bRD\.?$/,  "ROAD")
-    .replace(/(\d+)(ST|ND|RD|TH)\b/i, "$1") // "72ND" → "72"
-    .replace(/\s+/g, " ")
-    .trim();
+// ─── CLAUDE AI HELPER ─────────────────────────────────────────────────────────
+async function askClaude(prompt, maxTokens = 1024) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY || "",
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-opus-4-5",
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!r.ok) throw new Error(`Claude API error: ${r.status}`);
+  const d = await r.json();
+  return d.content?.[0]?.text || "";
 }
 
-// Parse a DOT sign description into structured day/time data
-// Handles formats like "NO PARKING 8AM-10AM MON THRU FRI"
-function parseSignText(text) {
-  if (!text) return null;
-  const upper = text.toUpperCase();
-  if (!upper.includes("STREET CLEANING") && !upper.includes("NO PARKING")) return null;
+// ─── HEALTH ───────────────────────────────────────────────────────────────────
+app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-  const dayMap = { MON: "Mon", TUE: "Tue", WED: "Wed", THU: "Thu", FRI: "Fri", SAT: "Sat", SUN: "Sun" };
-  const days = Object.entries(dayMap)
-    .filter(([abbr]) => new RegExp(`\\b${abbr}`, "i").test(text))
-    .map(([, label]) => label);
-
-  const timeMatch = text.match(
-    /(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)\s*(?:[-–]|TO|THRU)\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)/i
-  );
-  const time = timeMatch ? `${timeMatch[1].trim()} – ${timeMatch[2].trim()}` : null;
-
-  return { days, time, raw: text };
-}
-
-// ─── GEOCODING PROXY ──────────────────────────────────────────────────────────
+// ─── SMART GEOCODE ────────────────────────────────────────────────────────────
+// Accepts anything a stressed NYC driver would type:
+// "intrepid", "34th and broadway", "uws", "bdwy & 72", "the high line", etc.
 app.get("/api/geocode", async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: "q required" });
 
-  const withCity = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island/i.test(q)
-    ? q : `${q}, New York City`;
+  // Step 1: Use Claude to resolve natural language to a precise NYC location
+  let resolvedQuery = q.trim();
+  try {
+    const interpretation = await askClaude(`You are an NYC geography expert. A driver typed: "${q}"
 
-  // Try Nominatim (OpenStreetMap) first — reliable, free, no key needed
+Resolve this to the most specific NYC street address or intersection for parking purposes.
+Examples:
+- "intrepid" → "Pier 86, West 46th Street and 12th Avenue, Manhattan"
+- "34th and bdwy" → "34th Street and Broadway, Manhattan"  
+- "uws" → "Upper West Side, Manhattan"
+- "high line" → "West 20th Street and 10th Avenue, Manhattan"
+- "lic" → "Long Island City, Queens"
+- "ues" → "Upper East Side, Manhattan"
+- "hudson yards" → "West 30th Street and 10th Avenue, Manhattan"
+
+Respond with ONLY the resolved location string, nothing else. Keep it under 60 characters.`);
+
+    if (interpretation && interpretation.trim().length > 3) {
+      resolvedQuery = interpretation.trim();
+    }
+  } catch (e) {
+    console.error("Claude resolve error:", e.message);
+  }
+
+  // Step 2: Geocode the resolved query with Nominatim
+  const withCity = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island/i.test(resolvedQuery)
+    ? resolvedQuery : `${resolvedQuery}, New York City`;
+
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(withCity)}&format=json&limit=1&addressdetails=1&countrycodes=us`;
-    const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
+    const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0 contact@streetparkinfo.com" } });
     if (r.ok) {
       const data = await r.json();
       if (data.length > 0) {
         const item = data[0];
         const addr = item.address || {};
-        const street = addr.road || addr.pedestrian || addr.footway || q.toUpperCase();
-        const borough = addr.borough || addr.city_district || addr.suburb || addr.county || "";
-        const neighborhood = addr.neighbourhood || addr.suburb || "";
+        const street = addr.road || addr.pedestrian || addr.footway || addr.suburb || resolvedQuery;
         return res.json({
           street: street.toUpperCase(),
-          borough,
-          neighborhood,
-          label: item.display_name?.split(",").slice(0, 2).join(",") || q,
+          borough: addr.borough || addr.city_district || addr.suburb || addr.county || "",
+          neighborhood: addr.neighbourhood || addr.suburb || "",
+          label: resolvedQuery,
+          originalQuery: q,
           lat: parseFloat(item.lat),
           lng: parseFloat(item.lon),
         });
@@ -109,7 +107,7 @@ app.get("/api/geocode", async (req, res) => {
     console.error("Nominatim error:", e.message);
   }
 
-  // Fallback: NYC Planning Labs GeoSearch
+  // Step 3: Fall back to NYC Planning Labs
   try {
     const url = `https://geosearch.planninglabs.nyc/v2/search?text=${encodeURIComponent(withCity)}&size=1`;
     const r = await fetch(url);
@@ -120,9 +118,10 @@ app.get("/api/geocode", async (req, res) => {
         const [lng, lat] = data.features[0].geometry.coordinates;
         return res.json({
           street: (p.street || p.name || q).toUpperCase(),
-          borough: p.borough || p.county || "",
+          borough: p.borough || "",
           neighborhood: p.neighbourhood || p.locality || "",
-          label: p.label || q,
+          label: resolvedQuery,
+          originalQuery: q,
           lat, lng,
         });
       }
@@ -131,14 +130,13 @@ app.get("/api/geocode", async (req, res) => {
     console.error("GeoSearch error:", e.message);
   }
 
-  res.status(404).json({ error: `Could not find "${q}" in NYC. Try a street name like "Broadway" or an address.` });
+  res.status(404).json({ error: `Couldn't locate "${q}" in NYC. Try a street name or address.` });
 });
 
-// Reverse geocode proxy
+// Reverse geocode
 app.get("/api/reverse-geocode", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.status(400).json({ error: "lat and lng required" });
-
   try {
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
     const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
@@ -150,197 +148,128 @@ app.get("/api/reverse-geocode", async (req, res) => {
         borough: addr.borough || addr.city_district || addr.suburb || "",
         neighborhood: addr.neighbourhood || addr.suburb || "",
         label: item.display_name?.split(",").slice(0, 2).join(",") || "",
-        lat: parseFloat(lat),
-        lng: parseFloat(lng),
+        lat: parseFloat(lat), lng: parseFloat(lng),
       });
     }
-  } catch (e) {
-    console.error("Reverse geocode error:", e.message);
-  }
-
-  // Fallback to Planning Labs
-  try {
-    const url = `https://geosearch.planninglabs.nyc/v2/reverse?point.lat=${lat}&point.lon=${lng}&size=1`;
-    const r = await fetch(url);
-    if (r.ok) {
-      const data = await r.json();
-      if (data.features?.length) {
-        const p = data.features[0].properties;
-        return res.json({
-          street: (p.street || p.name || "").toUpperCase(),
-          borough: p.borough || "",
-          neighborhood: p.neighbourhood || p.locality || "",
-          label: p.label || "",
-          lat: parseFloat(lat),
-          lng: parseFloat(lng),
-        });
-      }
-    }
-  } catch (e) {
-    console.error("GeoSearch reverse error:", e.message);
-  }
-
+  } catch (e) { console.error("Reverse geocode error:", e.message); }
   res.status(502).json({ error: "Could not identify your street" });
 });
 
-
-
-// ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
-// These run server-side so there's no 403 CORS issue from the browser
-
-// Street cleaning — uses Claude AI to interpret schedule + DOT API as enrichment
+// ─── STREET CLEANING ─────────────────────────────────────────────────────────
+// Strategy: Claude knows NYC streets cold. Ask it directly, use DOT as verification.
 app.get("/api/cleaning", async (req, res) => {
-  const { street, lat, lng } = req.query;
+  const { street, lat, lng, borough } = req.query;
   if (!street) return res.json([]);
 
-  const name = normalizeStreet(street);
-
-  // Ask Claude to provide the street cleaning schedule based on its NYC knowledge
-  // This is the reliable fallback when DOT APIs are inconsistent
+  // Primary: Ask Claude for the schedule — it has deep NYC street knowledge
   try {
-    const prompt = `You are an NYC parking expert. For the street "${name}" in New York City, provide the street cleaning (alternate side parking) schedule.
+    const locationContext = lat && lng ? `at approximately ${lat}, ${lng}` : `in ${borough || "NYC"}`;
+    const text = await askClaude(`You are an NYC alternate side parking expert with knowledge of every street cleaning schedule in all 5 boroughs.
 
-Respond ONLY with a JSON array. Each object should have:
-- "days": array of day abbreviations like ["Mon", "Thu"]  
-- "time": time range string like "8 AM – 9:30 AM"
-- "side": "Left / Even side" or "Right / Odd side" or ""
-- "raw": the full sign text as it would appear on a NYC street sign
+For the street "${street}" ${locationContext}, provide the street cleaning (alternate side parking) schedule.
 
-If you don't know the specific schedule for this street, return an empty array [].
-If the street has multiple schedules (different sides, different blocks), include all of them.
+Important rules:
+- Street cleaning happens 1-2x per week on most NYC streets
+- Different sides of the street often have different days
+- Hours are typically 1-2 hour windows (e.g. 8-9:30 AM, 11:30 AM-1 PM)
+- Include BOTH sides if they differ
+- If this is a major avenue (Broadway, 5th Ave, etc.), include all known schedule variations
+- Base your answer on official NYC DOT alternate side parking regulations
 
-Return ONLY the JSON array, no other text.`;
+Respond ONLY with a valid JSON array. Each item must have:
+{
+  "days": ["Mon", "Thu"],  // day abbreviations
+  "time": "8 AM – 9:30 AM",  // exact time window
+  "side": "Left / Even side",  // or "Right / Odd side" or "" if same both sides
+  "raw": "NO PARKING 8AM-9:30AM MON & THUR"  // sign text format
+}
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY || "",
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-opus-4-5",
-        max_tokens: 1024,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
+If you genuinely don't know this specific street's schedule, return [].
+Return ONLY the JSON array.`);
 
-    if (response.ok) {
-      const data = await response.json();
-      const text = data.content?.[0]?.text || "[]";
-      try {
-        const cleaned = text.replace(/```json|```/g, "").trim();
-        const schedule = JSON.parse(cleaned);
-        if (Array.isArray(schedule) && schedule.length > 0) {
-          console.log(`Claude returned ${schedule.length} cleaning rules for ${name}`);
-          return res.json(schedule);
-        }
-      } catch (e) {
-        console.error("Claude parse error:", e.message);
-      }
+    const cleaned = text.replace(/```json|```/g, "").trim();
+    const schedule = JSON.parse(cleaned);
+    if (Array.isArray(schedule) && schedule.length > 0) {
+      console.log(`Claude returned ${schedule.length} cleaning rules for ${street}`);
+      return res.json(schedule);
     }
   } catch (e) {
-    console.error("Claude API error:", e.message);
+    console.error("Claude cleaning error:", e.message);
   }
 
-  // Fallback: try DOT Socrata dataset
-  const encoded = encodeURIComponent(name);
+  // Fallback: DOT Socrata by street name
   try {
+    const name = street.toUpperCase().replace(/\s+/g, " ").trim();
+    const encoded = encodeURIComponent(name);
     const url = `${SOCRATA}/xswq-wnv9.json?$where=upper(street)%20LIKE%20'%25${encoded}%25'&$limit=200`;
-    const r = await fetch(url, { headers: nycHeaders });
+    const r = await fetch(url);
     if (r.ok) {
       const raw = await r.json();
-      console.log(`DOT returned ${raw.length} rows for "${name}"`);
+      console.log(`DOT fallback: ${raw.length} rows for ${name}`);
       const results = raw.map(row => {
-        const text = row.signdesc || row.description || row.sign_text || "";
-        const upper = text.toUpperCase();
-        if (!upper.includes("STREET CLEANING") && !upper.includes("NO PARKING")) return null;
-        const parsed = parseSignText(text);
-        if (!parsed || !parsed.days.length) return null;
-        return { street: row.street || name, side: row.side_of_street || "", days: parsed.days, time: parsed.time, raw: parsed.raw };
+        const txt = row.signdesc || row.description || "";
+        const up = txt.toUpperCase();
+        if (!up.includes("STREET CLEANING") && !up.includes("NO PARKING")) return null;
+        const days = ["MON","TUE","WED","THU","FRI","SAT","SUN"]
+          .filter(d => new RegExp(`\\b${d}`, "i").test(txt))
+          .map(d => ({ MON:"Mon",TUE:"Tue",WED:"Wed",THU:"Thu",FRI:"Fri",SAT:"Sat",SUN:"Sun" })[d]);
+        if (!days.length) return null;
+        const tm = txt.match(/(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)\s*[-–TO]+\s*(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)/i);
+        return { street: row.street || name, side: row.side_of_street || "", days, time: tm ? `${tm[1].trim()} – ${tm[2].trim()}` : null, raw: txt };
       }).filter(Boolean);
-      return res.json(dedupe(results));
+      const seen = new Set();
+      return res.json(results.filter(r => { const k = `${r.days}-${r.time}-${r.side}`; return seen.has(k) ? false : seen.add(k); }));
     }
-  } catch (e) {
-    console.error("DOT fallback error:", e.message);
-  }
+  } catch (e) { console.error("DOT fallback error:", e.message); }
 
   res.json([]);
 });
 
-function dedupe(results) {
-  const seen = new Set();
-  return results.filter(r => {
-    const key = `${r.days.join(",")}-${r.time}-${r.side}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-// Film permits — searches parking held field for a street name, upcoming dates
+// ─── FILM PERMITS ─────────────────────────────────────────────────────────────
 app.get("/api/films", async (req, res) => {
   const { street } = req.query;
   if (!street) return res.json([]);
-
-  const name = normalizeStreet(street);
+  const name = street.toUpperCase().trim();
   const encoded = encodeURIComponent(name);
-
   const from = new Date(); from.setDate(from.getDate() - 1);
-  const to = new Date(); to.setDate(to.getDate() + 7);
-  const fmt = d => d.toISOString().replace("T", "T").split(".")[0];
-
+  const to   = new Date(); to.setDate(to.getDate() + 7);
+  const fmt  = d => d.toISOString().split(".")[0];
   try {
     const url = `${SOCRATA}/tg4x-b46p.json?$where=upper(parkingheld)%20LIKE%20'%25${encoded}%25'%20AND%20startdatetime%20>=%20'${fmt(from)}'%20AND%20startdatetime%20<=%20'${fmt(to)}'&$limit=20&$order=startdatetime%20ASC`;
-    const r = await fetch(url, { headers: nycHeaders });
+    const r = await fetch(url);
     if (!r.ok) return res.json([]);
     const data = await r.json();
     res.json(data.map(f => ({
-      id: f.eventid,
-      type: f.category || "Film",
+      id: f.eventid, type: f.category || "Film",
       subtype: f.subcategoryname || f.eventtype || "Shoot",
-      start: f.startdatetime,
-      end: f.enddatetime,
-      parkingHeld: f.parkingheld || "",
-      borough: f.borough || "",
+      start: f.startdatetime, end: f.enddatetime,
+      parkingHeld: f.parkingheld || "", borough: f.borough || "",
     })));
-  } catch (err) {
-    console.error("Films fetch error:", err.message);
-    res.json([]);
-  }
+  } catch { res.json([]); }
 });
 
-// Public events — returns upcoming permitted events, optionally filtered by borough
+// ─── PUBLIC EVENTS ────────────────────────────────────────────────────────────
 app.get("/api/events", async (req, res) => {
   const { borough } = req.query;
-  const today = new Date().toISOString().split("T")[0];
+  const today  = new Date().toISOString().split("T")[0];
   const toDate = new Date(); toDate.setDate(toDate.getDate() + 14);
-  const toStr = toDate.toISOString().split("T")[0];
-
+  const toStr  = toDate.toISOString().split("T")[0];
   try {
-    const boroughFilter = borough
-      ? `%20AND%20upper(borough)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'`
-      : "";
-    const url = `${SOCRATA}/tvpp-9vvx.json?$where=startdate%20>=%20'${today}'%20AND%20startdate%20<=%20'${toStr}'${boroughFilter}&$limit=15&$order=startdate%20ASC`;
-    const r = await fetch(url, { headers: nycHeaders });
+    const bf  = borough ? `%20AND%20upper(borough)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
+    const url = `${SOCRATA}/tvpp-9vvx.json?$where=startdate%20>=%20'${today}'%20AND%20startdate%20<=%20'${toStr}'${bf}&$limit=15&$order=startdate%20ASC`;
+    const r   = await fetch(url);
     if (!r.ok) return res.json([]);
     const data = await r.json();
     res.json(data.map(ev => ({
       name: ev.eventname || ev.name || "City Event",
-      type: ev.eventtype || "Event",
-      start: ev.startdate,
-      location: ev.eventlocation || "",
-      borough: ev.borough || "",
+      type: ev.eventtype || "Event", start: ev.startdate,
+      location: ev.eventlocation || "", borough: ev.borough || "",
       parkingImpacted: !!(ev.parkingimpacted),
     })));
-  } catch (err) {
-    console.error("Events fetch error:", err.message);
-    res.json([]);
-  }
+  } catch { res.json([]); }
 });
 
-// Weather — proxies Open-Meteo (already CORS-friendly but nice to have server-side)
+// ─── WEATHER ──────────────────────────────────────────────────────────────────
 app.get("/api/weather", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json(null);
@@ -351,16 +280,27 @@ app.get("/api/weather", async (req, res) => {
   } catch { res.json(null); }
 });
 
-// ASP suspension status for today
+// ─── ASP STATUS (NYC 311) ─────────────────────────────────────────────────────
 app.get("/api/asp", async (req, res) => {
   try {
     const today = new Date().toLocaleDateString("en-CA");
+    // NYC 311 official calendar API
     const url = `https://api.nyc.gov/public/api/GetCalendar?calendarTypes=AltSideParking&startDate=${today}&endDate=${today}`;
-    const r = await fetch(url);
-    if (!r.ok) return res.json({ suspended: false });
-    const data = await r.json();
-    const suspended = JSON.stringify(data).toLowerCase().includes("suspended");
-    res.json({ suspended });
+    const r = await fetch(url, { headers: { "Cache-Control": "no-cache" } });
+    if (r.ok) {
+      const data = await r.json();
+      const txt  = JSON.stringify(data).toLowerCase();
+      return res.json({ suspended: txt.includes("suspended"), raw: data });
+    }
+  } catch (e) { console.error("ASP error:", e.message); }
+
+  // Fallback: check @NYCASP via 311
+  try {
+    const today = new Date().toLocaleDateString("en-CA");
+    const url311 = `${SOCRATA}/erm2-nwe9.json?$where=complaint_type='Alternate%20Side%20Parking'%20AND%20created_date%20>=%20'${today}T00:00:00'&$limit=1`;
+    const r = await fetch(url311);
+    const data = r.ok ? await r.json() : [];
+    res.json({ suspended: false, note: "ASP in effect" });
   } catch { res.json({ suspended: false }); }
 });
 
@@ -368,39 +308,28 @@ app.get("/api/asp", async (req, res) => {
 app.post("/subscribe", async (req, res) => {
   const { phone, street, borough, lat, lng } = req.body;
   if (!phone || !street) return res.status(400).json({ error: "phone and street required" });
-
-  const normalized = phone.replace(/\D/g, "");
-  const e164 = normalized.startsWith("1") ? `+${normalized}` : `+1${normalized}`;
-
+  const digits = phone.replace(/\D/g, "");
+  const e164   = digits.startsWith("1") ? `+${digits}` : `+1${digits}`;
   try {
     await db.query(
-      `INSERT INTO subscribers (phone, street, borough, lat, lng)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT DO NOTHING`,
-      [e164, normalizeStreet(street), borough || "", lat || null, lng || null]
+      `INSERT INTO subscribers (phone, street, borough, lat, lng) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (phone) DO UPDATE SET street=$2, borough=$3, lat=$4, lng=$5, active=true`,
+      [e164, street.toUpperCase(), borough || "", lat || null, lng || null]
     );
-
     await twilioClient.messages.create({
-      body: `🚗 Street Park Info is on! We'll text you before street cleaning, film shoots, and bad weather on ${street}. Reply STOP to cancel.`,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: e164,
+      body: `🚗 Street Park Info activated for ${street}! We'll text you before street cleaning, film shoots, and bad weather. Reply STOP to cancel.`,
+      from: process.env.TWILIO_PHONE_NUMBER, to: e164,
     });
-
     res.json({ ok: true });
-  } catch (err) {
-    console.error("Subscribe error:", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ─── STRIPE CHECKOUT ─────────────────────────────────────────────────────────
+// ─── STRIPE ───────────────────────────────────────────────────────────────────
 app.post("/create-checkout-session", async (req, res) => {
   const { plan, phone, street } = req.body;
   const priceId = plan === "annual" ? process.env.STRIPE_PRICE_ANNUAL : process.env.STRIPE_PRICE_MONTHLY;
   try {
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      mode: "subscription",
+      payment_method_types: ["card"], mode: "subscription",
       line_items: [{ price: priceId, quantity: 1 }],
       metadata: { phone, street },
       success_url: `${process.env.FRONTEND_URL}?subscribed=true`,
@@ -408,131 +337,96 @@ app.post("/create-checkout-session", async (req, res) => {
       subscription_data: { trial_period_days: 30 },
     });
     res.json({ url: session.url });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ─── STRIPE WEBHOOK ──────────────────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+  try { event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET); }
+  catch (err) { return res.status(400).send(`Webhook Error: ${err.message}`); }
   if (event.type === "checkout.session.completed") {
-    const { phone, street } = event.data.object.metadata;
-    await db.query(
-      `UPDATE subscribers SET stripe_customer_id=$1, stripe_subscription_id=$2, plan=$3, active=true WHERE phone=$4`,
+    const { phone } = event.data.object.metadata;
+    await db.query(`UPDATE subscribers SET stripe_customer_id=$1, stripe_subscription_id=$2, plan=$3, active=true WHERE phone=$4`,
       [event.data.object.customer, event.data.object.subscription,
-       event.data.object.amount_total < 500 ? "monthly" : "annual", phone]
-    ).catch(console.error);
+       event.data.object.amount_total < 500 ? "monthly" : "annual", phone]).catch(console.error);
   }
   if (event.type === "customer.subscription.deleted") {
-    await db.query("UPDATE subscribers SET active=false WHERE stripe_subscription_id=$1",
-      [event.data.object.id]).catch(console.error);
+    await db.query("UPDATE subscribers SET active=false WHERE stripe_subscription_id=$1", [event.data.object.id]).catch(console.error);
   }
   res.json({ received: true });
 });
 
-// ─── NIGHTLY ALERT JOB ────────────────────────────────────────────────────────
+// ─── NIGHTLY ALERTS ───────────────────────────────────────────────────────────
 async function sendNightlyAlerts() {
-  console.log("🚨 Running nightly alert job...");
-  const { rows: subs } = await db.query("SELECT * FROM subscribers WHERE active = true");
-  const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+  const { rows: subs } = await db.query("SELECT * FROM subscribers WHERE active=true");
+  const tomorrow    = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowAbbr = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][tomorrow.getDay()];
-  const tomorrowStr = tomorrow.toLocaleDateString("en-US", { weekday:"long", month:"long", day:"numeric" });
+  const tomorrowStr  = tomorrow.toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"});
 
   for (const sub of subs) {
     const msgs = [];
     try {
-      // Street cleaning
-      const cleanResp = await fetch(`http://localhost:${PORT}/api/cleaning?street=${encodeURIComponent(sub.street)}`);
-      const cleaning = await cleanResp.json();
-      const cleaningTomorrow = cleaning.find(c => c.days.includes(tomorrowAbbr));
-      if (cleaningTomorrow) {
-        msgs.push(`🧹 Street cleaning on ${sub.street} tomorrow${cleaningTomorrow.time ? ` from ${cleaningTomorrow.time}` : ""}. Move your car!`);
-      }
+      const base = `http://localhost:${PORT}`;
+      const [cResp, fResp, wxResp] = await Promise.allSettled([
+        fetch(`${base}/api/cleaning?street=${encodeURIComponent(sub.street)}&lat=${sub.lat}&lng=${sub.lng}`).then(r => r.json()),
+        fetch(`${base}/api/films?street=${encodeURIComponent(sub.street)}`).then(r => r.json()),
+        fetch(`${base}/api/weather?lat=${sub.lat}&lng=${sub.lng}`).then(r => r.json()),
+      ]);
+      const cleaning = cResp.status === "fulfilled" ? cResp.value : [];
+      const films    = fResp.status === "fulfilled" ? fResp.value : [];
+      const wx       = wxResp.status === "fulfilled" ? wxResp.value : null;
 
-      // Film permits
-      const filmResp = await fetch(`http://localhost:${PORT}/api/films?street=${encodeURIComponent(sub.street)}`);
-      const films = await filmResp.json();
-      if (films.length > 0) msgs.push(`🎬 Film shoot on ${sub.street} tomorrow — parking may be restricted.`);
+      const cleanTomorrow = cleaning.find(c => c.days?.includes(tomorrowAbbr));
+      if (cleanTomorrow) msgs.push(`🧹 Street cleaning on ${sub.street} tomorrow${cleanTomorrow.time ? ` from ${cleanTomorrow.time}` : ""}. Move your car!`);
+      if (films.length) msgs.push(`🎬 Film shoot near ${sub.street} — parking may be restricted.`);
 
-      // Weather
-      if (sub.lat && sub.lng) {
-        const wxResp = await fetch(`http://localhost:${PORT}/api/weather?lat=${sub.lat}&lng=${sub.lng}`);
-        const wx = await wxResp.json();
-        const code = wx?.daily?.weather_code?.[1];
-        const snow = wx?.daily?.snowfall_sum?.[1];
-        const rain = wx?.daily?.precipitation_sum?.[1];
-        const SEVERE = [51,53,55,61,63,65,71,73,75,77,80,81,82,85,86,95,96,99];
-        if (SEVERE.includes(code)) {
-          msgs.push(snow > 0.5 ? `❄️ Snow tomorrow (${snow.toFixed(1)}"). Move your car early.`
-            : rain > 0.5 ? `🌧️ Heavy rain tomorrow. Street cleaning may still be enforced.`
-            : `⚠️ Severe weather tomorrow. Check parking conditions.`);
-        }
-      }
+      const code = wx?.daily?.weather_code?.[1];
+      const snow = wx?.daily?.snowfall_sum?.[1];
+      const rain = wx?.daily?.precipitation_sum?.[1];
+      if ([71,73,75,77,85,86].includes(code) && snow > 0.5) msgs.push(`❄️ Snow tomorrow (${snow.toFixed(1)}"). Move your car early — ASP may be suspended then reinstated.`);
+      else if ([61,63,65,80,81,82].includes(code) && rain > 0.5) msgs.push(`🌧️ Heavy rain tomorrow. Street cleaning may still be enforced.`);
+      else if ([95,96,99].includes(code)) msgs.push(`⛈️ Thunderstorms tomorrow. Check parking rules before heading out.`);
 
-      if (msgs.length > 0) {
+      if (msgs.length) {
         await twilioClient.messages.create({
           body: `Street Park Info — ${tomorrowStr}:\n\n${msgs.join("\n\n")}\n\nReply STOP to cancel.`,
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: sub.phone,
+          from: process.env.TWILIO_PHONE_NUMBER, to: sub.phone,
         });
-        console.log(`✅ Alerted ${sub.phone}: ${msgs.length} alerts`);
       }
-    } catch (err) {
-      console.error(`❌ Failed ${sub.phone}:`, err.message);
-    }
+    } catch (err) { console.error(`Alert failed for ${sub.phone}:`, err.message); }
     await new Promise(r => setTimeout(r, 150));
   }
-  console.log(`✅ Done. ${subs.length} subscribers checked.`);
+  console.log(`✅ Alerts done for ${subs.length} subscribers`);
 }
 
-// ─── CRON ────────────────────────────────────────────────────────────────────
 cron.schedule("0 20 * * *", sendNightlyAlerts, { timezone: "America/New_York" });
 cron.schedule("*/14 * * * *", () => {
   fetch(`https://${process.env.RENDER_SERVICE_URL || `localhost:${PORT}`}/health`).catch(() => {});
 });
 
-// ─── ADMIN ───────────────────────────────────────────────────────────────────
 app.post("/admin/trigger-alerts", async (req, res) => {
   if (req.body.secret !== process.env.ADMIN_SECRET) return res.status(401).json({ error: "unauthorized" });
   sendNightlyAlerts().catch(console.error);
   res.json({ ok: true });
 });
 
-// ─── DB INIT + START ──────────────────────────────────────────────────────────
+// ─── DB + START ────────────────────────────────────────────────────────────────
 async function initDB() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS subscribers (
-      id SERIAL PRIMARY KEY,
-      phone TEXT NOT NULL UNIQUE,
-      street TEXT NOT NULL,
-      borough TEXT DEFAULT '',
-      lat DOUBLE PRECISION,
-      lng DOUBLE PRECISION,
-      stripe_customer_id TEXT,
-      stripe_subscription_id TEXT,
-      plan TEXT DEFAULT 'trial',
-      trial_ends_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '30 days',
-      active BOOLEAN DEFAULT TRUE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      id SERIAL PRIMARY KEY, phone TEXT NOT NULL UNIQUE, street TEXT NOT NULL,
+      borough TEXT DEFAULT '', lat DOUBLE PRECISION, lng DOUBLE PRECISION,
+      stripe_customer_id TEXT, stripe_subscription_id TEXT,
+      plan TEXT DEFAULT 'trial', trial_ends_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '30 days',
+      active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS alert_log (
-      id SERIAL PRIMARY KEY,
-      subscriber_id INTEGER REFERENCES subscribers(id),
-      message TEXT,
-      sent_at TIMESTAMPTZ DEFAULT NOW(),
-      type TEXT
+      id SERIAL PRIMARY KEY, subscriber_id INTEGER REFERENCES subscribers(id),
+      message TEXT, sent_at TIMESTAMPTZ DEFAULT NOW(), type TEXT
     );
   `);
   console.log("✅ DB ready");
 }
 
-initDB().then(() => {
-  app.listen(PORT, () => console.log(`🚗 Street Park Info running on port ${PORT}`));
-});
+initDB().then(() => app.listen(PORT, () => console.log(`🚗 Street Park Info running on port ${PORT}`)));

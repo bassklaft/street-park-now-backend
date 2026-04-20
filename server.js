@@ -189,41 +189,74 @@ app.get("/api/reverse-geocode", async (req, res) => {
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 // These run server-side so there's no 403 CORS issue from the browser
 
-// Street cleaning schedule — searches DOT parking signs for a street name
+// Street cleaning schedule — uses OpenCurb API (free, no key, works by lat/lng)
+// Falls back to DOT dataset by street name
 app.get("/api/cleaning", async (req, res) => {
-  const { street } = req.query;
-  if (!street) return res.json([]);
+  const { street, lat, lng } = req.query;
+  if (!street && (!lat || !lng)) return res.json([]);
 
-  const name = normalizeStreet(street);
+  // If we have coordinates, use OpenCurb (most accurate — queries by location)
+  if (lat && lng) {
+    try {
+      const url = `https://www.opencurb.nyc/api/v1/signs?lat=${lat}&lng=${lng}&radius=50`;
+      const r = await fetch(url, { headers: { "Accept": "application/json" } });
+      if (r.ok) {
+        const data = await r.json();
+        const signs = Array.isArray(data) ? data : (data.signs || data.results || []);
+        const results = signs
+          .filter(s => {
+            const txt = (s.description || s.sign_text || s.regulation || s.text || "").toUpperCase();
+            return txt.includes("STREET CLEANING") || txt.includes("NO PARKING");
+          })
+          .map(s => {
+            const text = s.description || s.sign_text || s.regulation || s.text || "";
+            const parsed = parseSignText(text);
+            if (!parsed || !parsed.days.length) return null;
+            return {
+              street: street || s.street || "",
+              side: s.side || s.curb_side || "",
+              days: parsed.days,
+              time: parsed.time,
+              raw: parsed.raw,
+            };
+          })
+          .filter(Boolean);
+
+        if (results.length > 0) return res.json(dedupe(results));
+      }
+    } catch (e) {
+      console.error("OpenCurb error:", e.message);
+    }
+  }
+
+  // Fallback: DOT Socrata dataset by street name
+  // This dataset is two linked tables — we query both and join on order number
+  const name = normalizeStreet(street || "");
   const encoded = encodeURIComponent(name);
 
   try {
-    // Hit DOT parking signs dataset — signdesc is the correct field name
-    const url = `${SOCRATA}/xswq-wnv9.json?$where=upper(street)%20LIKE%20'%25${encoded}%25'&$limit=100&$order=street%20ASC`;
-    const r = await fetch(url, { headers: nycHeaders });
-
+    // Query locations table for the street, get order numbers
+    const locUrl = `${SOCRATA}/xswq-wnv9.json?$where=upper(street)%20LIKE%20'%25${encoded}%25'&$limit=200&$select=order_no,street,side_of_street,fromhousenumber,tohousenumber,signdesc`;
+    const r = await fetch(locUrl, { headers: nycHeaders });
     if (!r.ok) {
-      console.error("DOT API error:", r.status, await r.text());
+      console.error("DOT API error:", r.status);
       return res.json([]);
     }
-
     const raw = await r.json();
+    console.log(`DOT returned ${raw.length} rows for "${name}"`);
 
-    // Map to a clean shape the frontend can use directly
     const results = raw
       .map(row => {
-        // DOT dataset uses signdesc, some rows use description
         const text = row.signdesc || row.description || row.sign_text || "";
         const upper = text.toUpperCase();
-        // Only keep street cleaning / no parking rules
         if (!upper.includes("STREET CLEANING") && !upper.includes("NO PARKING")) return null;
         const parsed = parseSignText(text);
-        if (!parsed || parsed.days.length === 0) return null;
+        if (!parsed || !parsed.days.length) return null;
         return {
           street: row.street || name,
-          side: row.side_of_street || row.sos || "",
-          fromHouse: row.fromhousenumber || row.from_hn || "",
-          toHouse: row.tohousenumber || row.to_hn || "",
+          side: row.side_of_street || "",
+          fromHouse: row.fromhousenumber || "",
+          toHouse: row.tohousenumber || "",
           days: parsed.days,
           time: parsed.time,
           raw: parsed.raw,
@@ -231,21 +264,22 @@ app.get("/api/cleaning", async (req, res) => {
       })
       .filter(Boolean);
 
-    // Deduplicate — same days+time on same block often appears multiple times
-    const seen = new Set();
-    const deduped = results.filter(r => {
-      const key = `${r.days.join(",")}-${r.time}-${r.side}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    res.json(deduped);
+    res.json(dedupe(results));
   } catch (err) {
     console.error("Cleaning fetch error:", err.message);
     res.json([]);
   }
 });
+
+function dedupe(results) {
+  const seen = new Set();
+  return results.filter(r => {
+    const key = `${r.days.join(",")}-${r.time}-${r.side}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 // Film permits — searches parking held field for a street name, upcoming dates
 app.get("/api/films", async (req, res) => {

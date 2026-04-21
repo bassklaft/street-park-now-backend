@@ -49,88 +49,84 @@ async function askClaude(prompt, maxTokens = 1024) {
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 // ─── SMART GEOCODE ────────────────────────────────────────────────────────────
-// Accepts anything a stressed NYC driver would type:
-// "intrepid", "34th and broadway", "uws", "bdwy & 72", "the high line", etc.
 app.get("/api/geocode", async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: "q required" });
 
-  // Step 1: Use Claude to resolve natural language to a precise NYC location
-  let resolvedQuery = q.trim();
+  // Claude returns precise coordinates directly — most reliable for NYC queries
   try {
-    const interpretation = await askClaude(`You are an NYC geography expert. A driver typed: "${q}"
+    const claudeResult = await askClaude(`You are an NYC geography and parking expert. A driver needs parking near: "${q}"
 
-Resolve this to the most specific NYC street address or intersection for parking purposes.
-Examples:
-- "intrepid" → "Pier 86, West 46th Street and 12th Avenue, Manhattan"
-- "34th and bdwy" → "34th Street and Broadway, Manhattan"  
-- "uws" → "Upper West Side, Manhattan"
-- "high line" → "West 20th Street and 10th Avenue, Manhattan"
-- "lic" → "Long Island City, Queens"
-- "ues" → "Upper East Side, Manhattan"
-- "hudson yards" → "West 30th Street and 10th Avenue, Manhattan"
+Return ONLY a valid JSON object:
+{
+  "street": "WEST 46 STREET",
+  "borough": "Manhattan",
+  "neighborhood": "Hell's Kitchen",
+  "label": "Intrepid Museum area",
+  "lat": 40.7648,
+  "lng": -74.0079
+}
 
-Respond with ONLY the resolved location string, nothing else. Keep it under 60 characters.`);
+Rules:
+- street = nearest main street for parking (ALL CAPS, no abbreviations)
+- Always default to Manhattan unless another borough clearly specified
+- For intersections like "34th and bdwy": 34th St & Broadway Manhattan = lat 40.7505, lng -73.9895
+- bdwy/bway = Broadway; ave = Avenue; st = Street
 
-    if (interpretation && interpretation.trim().length > 3) {
-      resolvedQuery = interpretation.trim();
+Common locations:
+- intrepid/intrepid museum = West 46th St & 12th Ave Manhattan, lat 40.7648, lng -74.0079
+- uws/upper west side = Central Park West Manhattan, lat 40.7870, lng -73.9754
+- ues/upper east side = Park Avenue Manhattan, lat 40.7736, lng -73.9566
+- lic/long island city = Jackson Ave Queens, lat 40.7447, lng -73.9485
+- high line = West 20th St Manhattan, lat 40.7480, lng -74.0048
+- hudson yards = West 30th St Manhattan, lat 40.7539, lng -74.0005
+- flatiron = 23rd St & 5th Ave Manhattan, lat 40.7411, lng -73.9897
+- msg/madison square garden = 33rd St & 7th Ave Manhattan, lat 40.7505, lng -73.9934
+- times square = 42nd St & Broadway Manhattan, lat 40.7580, lng -73.9855
+- yankee stadium = 161st St & River Ave Bronx, lat 40.8296, lng -73.9262
+- barclays/barclay center = Atlantic Ave Brooklyn, lat 40.6826, lng -73.9754
+- dumbo = Washington St Brooklyn, lat 40.7033, lng -73.9881
+- williamsburg = Bedford Ave Brooklyn, lat 40.7081, lng -73.9571
+- astoria = 31st St Queens, lat 40.7721, lng -73.9302
+- west village = Hudson St Manhattan, lat 40.7339, lng -74.0042
+- east village = 2nd Ave Manhattan, lat 40.7265, lng -73.9815
+- soho = Spring St Manhattan, lat 40.7233, lng -74.0030
+
+Return ONLY the JSON object, no markdown.`);
+
+    const cleaned = claudeResult.replace(/```json|```/g, "").trim();
+    const loc = JSON.parse(cleaned);
+    if (loc.lat && loc.lng && loc.street) {
+      console.log(`Claude geocoded "${q}" → ${loc.label} (${loc.lat}, ${loc.lng})`);
+      return res.json({ ...loc, originalQuery: q });
     }
   } catch (e) {
-    console.error("Claude resolve error:", e.message);
+    console.error("Claude geocode error:", e.message, claudeResult);
   }
 
-  // Step 2: Geocode the resolved query with Nominatim
-  const withCity = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island/i.test(resolvedQuery)
-    ? resolvedQuery : `${resolvedQuery}, New York City`;
-
+  // Fallback: Nominatim bounded to NYC
+  const withCity = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island/i.test(q)
+    ? q : `${q}, New York City NY`;
   try {
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(withCity)}&format=json&limit=1&addressdetails=1&countrycodes=us`;
-    const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0 contact@streetparkinfo.com" } });
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(withCity)}&format=json&limit=1&addressdetails=1&countrycodes=us&viewbox=-74.2591,40.4774,-73.7004,40.9176&bounded=1`;
+    const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
     if (r.ok) {
       const data = await r.json();
       if (data.length > 0) {
         const item = data[0];
         const addr = item.address || {};
-        const street = addr.road || addr.pedestrian || addr.footway || addr.suburb || resolvedQuery;
         return res.json({
-          street: street.toUpperCase(),
-          borough: addr.borough || addr.city_district || addr.suburb || addr.county || "",
+          street: (addr.road || addr.pedestrian || addr.suburb || q).toUpperCase(),
+          borough: addr.borough || addr.city_district || addr.suburb || "",
           neighborhood: addr.neighbourhood || addr.suburb || "",
-          label: resolvedQuery,
-          originalQuery: q,
-          lat: parseFloat(item.lat),
-          lng: parseFloat(item.lon),
+          label: q, originalQuery: q,
+          lat: parseFloat(item.lat), lng: parseFloat(item.lon),
         });
       }
     }
-  } catch (e) {
-    console.error("Nominatim error:", e.message);
-  }
+  } catch (e) { console.error("Nominatim error:", e.message); }
 
-  // Step 3: Fall back to NYC Planning Labs
-  try {
-    const url = `https://geosearch.planninglabs.nyc/v2/search?text=${encodeURIComponent(withCity)}&size=1`;
-    const r = await fetch(url);
-    if (r.ok) {
-      const data = await r.json();
-      if (data.features?.length) {
-        const p = data.features[0].properties;
-        const [lng, lat] = data.features[0].geometry.coordinates;
-        return res.json({
-          street: (p.street || p.name || q).toUpperCase(),
-          borough: p.borough || "",
-          neighborhood: p.neighbourhood || p.locality || "",
-          label: resolvedQuery,
-          originalQuery: q,
-          lat, lng,
-        });
-      }
-    }
-  } catch (e) {
-    console.error("GeoSearch error:", e.message);
-  }
-
-  res.status(404).json({ error: `Couldn't locate "${q}" in NYC. Try a street name or address.` });
+  res.status(404).json({ error: `Couldn't find "${q}" in NYC. Try "34th St and Broadway" or "West Village".` });
 });
 
 // Reverse geocode

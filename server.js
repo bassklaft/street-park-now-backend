@@ -341,54 +341,61 @@ Return ONLY the JSON object starting with {:`, 3000);
 
   res.json({});
 });
-// Returns nearby streets with cleaning urgency for color-coded map display
+// ─── PARKING HEAT MAP — real street geometries from OpenStreetMap ─────────────
 app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
   try {
-    const raw = await askClaude(`You are an NYC parking expert. For coordinates lat=${lat}, lng=${lng}, list the 12 nearest streets with their alternate side parking schedules.
+    // Step 1: Get real street geometries from Overpass API
+    const overpassQuery = `[out:json][timeout:15];way(around:400,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street)$"]["name"];out geom;`;
+    const r = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
+    if (!r.ok) return res.json([]);
+    const data = await r.json();
+    const ways = (data.elements || []).filter(w => w.tags?.name && w.geometry?.length > 1);
 
-Return ONLY a JSON array. Each item:
-{
-  "street": "WEST 46 STREET",
-  "schedule": [
-    { "days": ["Mon","Thu"], "time": "8 AM - 9:30 AM", "side": "N" },
-    { "days": ["Tue","Fri"], "time": "8 AM - 9:30 AM", "side": "S" }
-  ],
-  "coords": [[lat1,lng1],[lat2,lng2],[lat3,lng3]]
-}
+    // Step 2: Get unique street names
+    const streetNames = [...new Set(ways.map(w => w.tags.name.toUpperCase()))].slice(0, 20);
+    if (!streetNames.length) return res.json([]);
 
-coords should be 2-4 points that draw the street segment near this location.
-Include the street the user is ON plus nearby parallel and cross streets.
-Return ONLY the JSON array.`, 2000);
+    // Step 3: One Claude call for all schedules
+    const schedulesRaw = await askClaude(`NYC alternate side parking schedules near lat=${lat}, lng=${lng}.
 
-    const match = raw.match(/\[[\s\S]*\]/);
-    if (match) {
-      const streets = JSON.parse(match[0]);
-      const today = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
-      const tomorrow = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+86400000).getDay()];
-      const dayAfter = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+172800000).getDay()];
+Streets:
+${streetNames.map((s,i) => `${i+1}. ${s}`).join("\n")}
 
-      const result = streets.map(s => {
-        let urgency = "green"; // safe 4+ days
+Return ONLY a JSON object. Key = street name in CAPS, value = array of schedules (empty array if unknown).
+{"BEDFORD AVENUE":[{"days":["Mon","Thu"],"time":"8 AM - 9:30 AM"}],"BERRY STREET":[]}
+Return ONLY the JSON object:`, 2000);
+
+    let schedules = {};
+    try { const m = schedulesRaw.match(/\{[\s\S]*\}/); if (m) schedules = JSON.parse(m[0]); } catch(e) {}
+
+    const today    = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
+    const tomorrow = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+86400000).getDay()];
+    const in2days  = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+172800000).getDay()];
+    const in3days  = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+259200000).getDay()];
+
+    // Step 4: Merge real geometry with schedule urgency — keep ALL segments
+    const result = ways.map(w => {
+        const name = w.tags.name.toUpperCase();
+        const sch = schedules[name] || [];
+        const coords = w.geometry.map(p => [p.lat, p.lon]);
+        let urgency = sch.length ? "green" : "gray";
         let nextClean = null;
-        for (const sch of (s.schedule || [])) {
-          const days = sch.days || [];
-          if (days.includes(today)) { urgency = "red"; nextClean = `Today ${sch.time}`; break; }
-          if (days.includes(tomorrow)) { urgency = "red"; nextClean = `Tomorrow ${sch.time}`; break; }
-          if (days.includes(dayAfter)) { if (urgency !== "red") urgency = "yellow"; nextClean = `In 2 days ${sch.time}`; }
-          else if (urgency === "green") { urgency = "green"; }
+        for (const s of sch) {
+          const days = s.days || [];
+          if (days.includes(today))    { urgency = "red";    nextClean = `Today ${s.time||""}`.trim(); break; }
+          if (days.includes(tomorrow)) { urgency = "red";    nextClean = `Tomorrow ${s.time||""}`.trim(); break; }
+          if (days.includes(in2days) || days.includes(in3days)) {
+            if (urgency !== "red") { urgency = "yellow"; nextClean = `In 2-3 days ${s.time||""}`.trim(); }
+          }
         }
-        if (!s.schedule?.length) urgency = "gray";
-        return { ...s, urgency, nextClean };
+        return { street: name, coords, urgency, nextClean };
       });
 
-      return res.json(result);
-    }
-  } catch(e) { console.error("Heatmap error:", e.message); }
-
-  res.json([]);
+    res.json(result);
+  } catch(e) { console.error("Heatmap error:", e.message); res.json([]); }
 });
 // Strategy: search by street name fragments, nearby cross streets, and borough-wide
 // NYC Open Data dataset tg4x-b46p is the official Mayor's Office of Media & Entertainment permits

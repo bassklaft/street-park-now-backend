@@ -158,8 +158,39 @@ Return ONLY the JSON, no markdown.`, 3000);
       const data = await r.json();
       if (data.length > 0) {
         const item = data[0], addr = item.address || {};
+        const lat = parseFloat(item.lat), lng = parseFloat(item.lon);
         const city = addr.city || addr.town || addr.county || "";
-        return res.json({ type:"location", isEstablishment:false, isPark:false, isZip:false, street:(addr.road||addr.pedestrian||addr.suburb||q).toUpperCase(), borough:addr.borough||addr.city_district||addr.suburb||"", neighborhood:addr.neighbourhood||addr.suburb||"", city, label:q, originalQuery:q, lat:parseFloat(item.lat), lng:parseFloat(item.lon) });
+        const street = (addr.road || addr.pedestrian || addr.suburb || q).toUpperCase();
+        const borough = addr.borough || addr.city_district || addr.suburb || "";
+        const neighborhood = addr.neighbourhood || addr.suburb || "";
+
+        // If query looks like a street address (starts with number), treat like GPS
+        // and return surrounding streets sorted by proximity
+        const isAddress = /^\d+\s+\w/.test(q.trim());
+        if (isAddress) {
+          // Get nearby streets via the same logic as reverse-geocode
+          let nearbyStreets = [street];
+          try {
+            const raw = await askClaude(`You are an urban geography expert. Given coordinates lat=${lat}, lng=${lng} in ${neighborhood || borough || city}, list the 12 nearest streets sorted closest to farthest. The primary street is "${street}".
+
+Return ONLY a JSON array of street names in ALL CAPS. Include cross streets and parallel streets within about a 6-block radius.
+Return ONLY the array.`, 1000);
+            const match = raw.match(/\[[\s\S]*\]/);
+            if (match) {
+              const parsed = JSON.parse(match[0]);
+              if (Array.isArray(parsed) && parsed.length > 0) nearbyStreets = parsed;
+            }
+          } catch(e) { console.error("Nearby streets error:", e.message); }
+
+          return res.json({
+            type: "location", isGPS: true, isEstablishment: false, isPark: false, isZip: false,
+            street, borough, neighborhood, city,
+            label: q, originalQuery: q, lat, lng,
+            nearbyStreets,
+          });
+        }
+
+        return res.json({ type:"location", isEstablishment:false, isPark:false, isZip:false, street, borough, neighborhood, city, label:q, originalQuery:q, lat, lng });
       }
     }
   } catch (e) { console.error("Nominatim error:", e.message); }
@@ -191,12 +222,10 @@ app.get("/api/reverse-geocode", async (req, res) => {
   // Get nearby streets sorted by distance using Nominatim search in bounding box
   let nearbyStreets = [];
   try {
-    const raw = await askClaude(`You are an NYC geography expert. Given these coordinates: lat ${lat}, lng ${lng} (${neighborhood}, ${borough}), list the 8 nearest streets to this location, sorted from closest to farthest. The primary street is "${primaryStreet}".
+    const raw = await askClaude(`You are an urban geography expert. Given coordinates lat=${lat}, lng=${lng} (${neighborhood}, ${borough}), list the 12 nearest streets sorted from closest to farthest. The primary street is "${primaryStreet}".
 
-Return ONLY a JSON array of street names in ALL CAPS. Start with the primary street, then the nearest cross streets and parallel streets.
-Example: ["WEST 46 STREET","ELEVENTH AVENUE","WEST 45 STREET","WEST 47 STREET","TWELFTH AVENUE","TENTH AVENUE","WEST 44 STREET","WEST 48 STREET"]
-
-Return ONLY the JSON array.`);
+Return ONLY a JSON array of street names in ALL CAPS. Include cross streets and parallel streets within a 6-block radius.
+Return ONLY the JSON array.`, 1000);
     const match = raw.match(/\[[\s\S]*\]/);
     if (match) {
       const parsed = JSON.parse(match[0]);

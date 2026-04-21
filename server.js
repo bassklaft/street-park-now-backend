@@ -78,54 +78,69 @@ app.get("/api/geocode", async (req, res) => {
   try {
     raw = await askClaude(`You are an NYC geography and parking expert. A driver typed: "${q}"
 
-First decide: is this AMBIGUOUS? A query is ambiguous if it could refer to multiple different things in NYC — e.g. "Greenpoint" could be the neighborhood OR Greenpoint Avenue. "Astoria" could be the neighborhood OR Astoria Boulevard. "Atlantic" could be Atlantic Avenue OR Atlantic Terminal area.
+First decide: is this AMBIGUOUS? (could refer to multiple different things in NYC)
+Then decide: is this a NEIGHBORHOOD? (a named NYC neighborhood with multiple streets)
 
-If AMBIGUOUS, return:
+If AMBIGUOUS (could be neighborhood AND street AND/OR landmark):
 {
   "type": "ambiguous",
   "label": "Greenpoint",
   "options": [
-    { "category": "Neighborhood", "label": "Greenpoint, Brooklyn", "type": "location", "street": "MANHATTAN AVENUE", "borough": "Brooklyn", "neighborhood": "Greenpoint", "lat": 40.7282, "lng": -73.9542 },
+    { "category": "Neighborhood", "label": "Greenpoint, Brooklyn", "type": "neighborhood", "street": "MANHATTAN AVENUE", "borough": "Brooklyn", "neighborhood": "Greenpoint", "lat": 40.7282, "lng": -73.9542, "neighborhoodStreets": ["ASH STREET","BOX STREET","CALYER STREET","EAGLE STREET","FREEMAN STREET","GREENPOINT AVENUE","HURON STREET","INDIA STREET","JAVA STREET","KENT STREET","LORIMER STREET","MANHATTAN AVENUE","MESEROLE AVENUE","MONITOR STREET","NASSAU AVENUE","NEWEL STREET","NORMAN AVENUE","PROVOST STREET","RICHARDSON STREET","RUSSELL STREET","VAN DAM STREET"] },
+    { "category": "Street", "label": "Greenpoint Ave, Brooklyn", "type": "location", "street": "GREENPOINT AVENUE", "borough": "Brooklyn", "neighborhood": "Greenpoint", "lat": 40.7270, "lng": -73.9490 },
     { "category": "Street", "label": "Greenpoint Ave, Queens", "type": "location", "street": "GREENPOINT AVENUE", "borough": "Queens", "neighborhood": "Sunnyside", "lat": 40.7447, "lng": -73.9165 }
   ]
 }
 
-Otherwise classify as: establishment | park | zip | location
+If NEIGHBORHOOD (clearly a specific NYC neighborhood, not ambiguous):
+{
+  "type": "neighborhood",
+  "label": "Brooklyn Heights, Brooklyn",
+  "isNeighborhood": true,
+  "street": "BROOKLYN HEIGHTS PROMENADE",
+  "borough": "Brooklyn",
+  "neighborhood": "Brooklyn Heights",
+  "lat": 40.6960,
+  "lng": -73.9951,
+  "neighborhoodStreets": ["ATLANTIC AVENUE","BROOKLYN HEIGHTS PROMENADE","CLARK STREET","COLUMBIA HEIGHTS","CRANBERRY STREET","GRACE COURT","HENRY STREET","HICKS STREET","JORALEMON STREET","LOVE LANE","MIDDAGH STREET","MONTAGUE STREET","ORANGE STREET","PIERREPONT STREET","PINEAPPLE STREET","POPLAR STREET","REMSEN STREET","VINE STREET","WILLOW STREET","WILLOW PLACE"]
+}
+neighborhoodStreets must be ALL streets in the neighborhood, sorted alphabetically.
 
-If ESTABLISHMENT (business/chain - e.g. "McDonald's", "CVS", "Starbucks"):
-{ "type": "establishment", "label": "McDonald's NYC locations", "isEstablishment": true, "establishments": [{ "name": "McDonald's Times Square", "street": "WEST 42 STREET", "borough": "Manhattan", "neighborhood": "Midtown", "address": "220 W 42nd St", "lat": 40.7580, "lng": -73.9855 }] }
-List ALL known NYC locations (8-15+ for major chains).
+If ESTABLISHMENT: { "type": "establishment", "label": "McDonald's NYC", "isEstablishment": true, "establishments": [{ "name": "McDonald's Times Square", "street": "WEST 42 STREET", "borough": "Manhattan", "neighborhood": "Midtown", "address": "220 W 42nd St", "lat": 40.7580, "lng": -73.9855 }] }
 
-If PARK:
-{ "type": "park", "label": "Central Park", "isPark": true, "isEstablishment": false, "street": "CENTRAL PARK WEST", "borough": "Manhattan", "neighborhood": "Upper West Side", "lat": 40.7851, "lng": -73.9683, "parkStreets": ["CENTRAL PARK WEST","FIFTH AVENUE","CENTRAL PARK NORTH","CENTRAL PARK SOUTH"] }
+If PARK: { "type": "park", "label": "Central Park", "isPark": true, "street": "CENTRAL PARK WEST", "borough": "Manhattan", "neighborhood": "Upper West Side", "lat": 40.7851, "lng": -73.9683, "parkStreets": ["CENTRAL PARK WEST","FIFTH AVENUE","CENTRAL PARK NORTH","CENTRAL PARK SOUTH"] }
 
-If ZIP CODE:
-{ "type": "zip", "label": "11211 Williamsburg", "isZip": true, "isEstablishment": false, "street": "BEDFORD AVENUE", "borough": "Brooklyn", "neighborhood": "Williamsburg", "lat": 40.7081, "lng": -73.9571, "zipStreets": ["BEDFORD AVENUE","BERRY STREET","WYTHE AVENUE","NORTH 6 STREET","METROPOLITAN AVENUE","GRAND STREET","UNION AVENUE"] }
+If ZIP: { "type": "zip", "label": "11211 Williamsburg", "isZip": true, "street": "BEDFORD AVENUE", "borough": "Brooklyn", "neighborhood": "Williamsburg", "lat": 40.7081, "lng": -73.9571, "zipStreets": ["BEDFORD AVENUE","BERRY STREET","WYTHE AVENUE","NORTH 6 STREET","METROPOLITAN AVENUE","GRAND STREET","UNION AVENUE"] }
 
-If LOCATION (specific intersection/landmark/address with no ambiguity):
-{ "type": "location", "label": "Hell's Kitchen", "isEstablishment": false, "isPark": false, "isZip": false, "street": "NINTH AVENUE", "borough": "Manhattan", "neighborhood": "Hell's Kitchen", "lat": 40.7638, "lng": -73.9918 }
+If specific LOCATION (intersection/address/landmark, not a neighborhood): { "type": "location", "street": "NINTH AVENUE", "borough": "Manhattan", "neighborhood": "Hell's Kitchen", "label": "Hell's Kitchen", "lat": 40.7638, "lng": -73.9918 }
 
 AMBIGUOUS EXAMPLES:
-- "greenpoint" → 3 options: neighborhood Greenpoint Brooklyn + street Greenpoint Avenue Brooklyn + street Greenpoint Avenue Queens
-- "astoria" → neighborhood Astoria Queens + street Astoria Boulevard Queens
-- "atlantic" → Atlantic Avenue Brooklyn (street) + Atlantic Terminal Brooklyn (landmark)
-- "chelsea" → neighborhood Chelsea Manhattan + Chelsea Piers Manhattan (landmark) + Chelsea Market Manhattan (landmark)
-- "park slope" → NOT ambiguous (clearly a neighborhood)
-- "broadway" → NOT ambiguous (clearly the street)
-- "34th and broadway" → NOT ambiguous (clearly an intersection)
+- "greenpoint" → ambiguous: neighborhood BK + street BK + street Queens
+- "astoria" → ambiguous: neighborhood Queens + street Astoria Blvd Queens
+- "atlantic" → ambiguous: Atlantic Avenue BK (street) + Atlantic Terminal BK (landmark)
+- "chelsea" → ambiguous: neighborhood Manhattan + Chelsea Piers + Chelsea Market
 
-IMPORTANT: If a name is both a neighborhood AND a street in the same borough, include BOTH as separate options.
+NEIGHBORHOOD EXAMPLES (not ambiguous):
+- "brooklyn heights" → neighborhood type with all its streets
+- "park slope" → neighborhood type with all its streets
+- "upper west side" → neighborhood type with all its streets
+- "hell's kitchen" → neighborhood type with all its streets
+- "greenwich village" → neighborhood type with all its streets
+- "flushing" → neighborhood type with all its streets
 
-KEY COORDS: intrepid=40.7648,-74.0079 | times sq=40.7580,-73.9855 | uws=40.7870,-73.9754 | ues=40.7736,-73.9566 | msg=40.7505,-73.9934 | high line=40.7480,-74.0048 | hudson yards=40.7539,-74.0005 | yankee stadium=40.8296,-73.9262 | barclays=40.6826,-73.9754 | 34th+broadway=40.7505,-73.9895 | central park=40.7851,-73.9683 | prospect park=40.6602,-73.9690 | west village=40.7339,-74.0042 | east village=40.7265,-73.9815 | soho=40.7233,-74.0030 | dumbo=40.7033,-73.9881 | williamsburg=40.7081,-73.9571 | lic=40.7447,-73.9485 | greenpoint=40.7282,-73.9542 | astoria neighborhood=40.7721,-73.9302
+KEY COORDS: intrepid=40.7648,-74.0079 | times sq=40.7580,-73.9855 | uws=40.7870,-73.9754 | ues=40.7736,-73.9566 | msg=40.7505,-73.9934 | central park=40.7851,-73.9683 | prospect park=40.6602,-73.9690 | west village=40.7339,-74.0042 | east village=40.7265,-73.9815 | soho=40.7233,-74.0030 | dumbo=40.7033,-73.9881 | williamsburg=40.7081,-73.9571 | lic=40.7447,-73.9485 | brooklyn heights=40.6960,-73.9951 | park slope=40.6681,-73.9800 | greenpoint=40.7282,-73.9542 | astoria=40.7721,-73.9302
 
 ZIP STREETS: 10001=[WEST 34 STREET,SEVENTH AVENUE,EIGHTH AVENUE,NINTH AVENUE,TENTH AVENUE] | 10014=[HUDSON STREET,BLEECKER STREET,CHRISTOPHER STREET,WEST 4 STREET] | 10023=[BROADWAY,AMSTERDAM AVENUE,COLUMBUS AVENUE,WEST END AVENUE,RIVERSIDE DRIVE] | 10036=[WEST 42 STREET,EIGHTH AVENUE,NINTH AVENUE,TENTH AVENUE,ELEVENTH AVENUE] | 11211=[BEDFORD AVENUE,BERRY STREET,WYTHE AVENUE,NORTH 6 STREET,METROPOLITAN AVENUE,GRAND STREET] | 11215=[FIFTH AVENUE,SEVENTH AVENUE,FLATBUSH AVENUE,PROSPECT PARK WEST,UNION STREET] | 11101=[JACKSON AVENUE,QUEENS BOULEVARD,NORTHERN BOULEVARD,THOMSON AVENUE,HUNTER STREET]
 
-Return ONLY the JSON, no markdown.`, 2000);
+Return ONLY the JSON, no markdown.`, 2500);
 
     const loc = JSON.parse(raw.replace(/```json|```/g,"").trim());
 
-    if (loc.type === "ambiguous") {
-      return res.json({ ...loc, originalQuery: q });
+    if (loc.type === "ambiguous") return res.json({ ...loc, originalQuery: q });
+
+    // Neighborhood — treat like zip but with neighborhoodStreets
+    if (loc.type === "neighborhood" || loc.isNeighborhood) {
+      return res.json({ ...loc, isNeighborhood: true, isZip: false, isPark: false, isEstablishment: false, zipStreets: loc.neighborhoodStreets || [], originalQuery: q });
     }
 
     if (loc.isEstablishment && loc.establishments?.length > 0 && userLat && userLng) {
@@ -138,7 +153,7 @@ Return ONLY the JSON, no markdown.`, 2000);
     }
   } catch (e) { console.error("Claude geocode error:", e.message); }
 
-  // Nominatim fallback bounded to NYC
+  // Nominatim fallback
   try {
     const withCity = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island/i.test(q) ? q : `${q}, New York City NY`;
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(withCity)}&format=json&limit=1&addressdetails=1&countrycodes=us&viewbox=-74.2591,40.4774,-73.7004,40.9176&bounded=1`;
@@ -152,7 +167,7 @@ Return ONLY the JSON, no markdown.`, 2000);
     }
   } catch (e) { console.error("Nominatim error:", e.message); }
 
-  res.status(404).json({ error: `Couldn't find "${q}" in NYC. Try "34th & Broadway", "10036", or "West Village".` });
+  res.status(404).json({ error: `Couldn't find "${q}" in NYC. Try "34th & Broadway", "10036", or "Brooklyn Heights".` });
 });
 
 // Reverse geocode
@@ -170,7 +185,22 @@ app.get("/api/reverse-geocode", async (req, res) => {
   res.status(502).json({ error: "Could not identify your street" });
 });
 
-// ─── STREET CLEANING ─────────────────────────────────────────────────────────
+// Helper: get next N upcoming dates for given day abbreviations
+function getUpcomingDates(days, weeksAhead = 2) {
+  const dayIndex = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const dates = [];
+  for (let i = 0; i <= weeksAhead * 7; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + i);
+    const abbr = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()];
+    if (days.includes(abbr)) {
+      dates.push(d.toLocaleDateString("en-US", { weekday:"short", month:"short", day:"numeric" }));
+    }
+  }
+  return dates.slice(0, 6); // next 6 occurrences
+}
 app.get("/api/cleaning", async (req, res) => {
   const { street, lat, lng, borough } = req.query;
   if (!street) return res.json([]);
@@ -202,7 +232,9 @@ Respond with ONLY the JSON array starting with [:`);
     const match = text.match(/\[[\s\S]*\]/);
     if (match) {
       const schedule = JSON.parse(match[0]);
-      if (Array.isArray(schedule) && schedule.length > 0) return res.json(schedule);
+      if (Array.isArray(schedule) && schedule.length > 0) {
+        return res.json(schedule.map(s => ({ ...s, upcomingDates: getUpcomingDates(s.days || []) })));
+      }
     }
   } catch (e) { console.error("Claude cleaning error:", e.message); }
 
@@ -215,7 +247,7 @@ Respond with ONLY the JSON array starting with [:`);
       const results = raw.map(row => {
         const parsed = parseSignText(row.signdesc || row.description || "");
         if (!parsed || !parsed.days.length) return null;
-        return { street: row.street || name, side: row.side_of_street || "", days: parsed.days, time: parsed.time, raw: parsed.raw };
+        return { street: row.street || name, side: row.side_of_street || "", days: parsed.days, time: parsed.time, raw: parsed.raw, upcomingDates: getUpcomingDates(parsed.days) };
       }).filter(Boolean);
       return res.json(dedupe(results));
     }

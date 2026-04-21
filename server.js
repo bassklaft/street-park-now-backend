@@ -106,12 +106,15 @@ If LOCATION (specific intersection/landmark/address with no ambiguity):
 { "type": "location", "label": "Hell's Kitchen", "isEstablishment": false, "isPark": false, "isZip": false, "street": "NINTH AVENUE", "borough": "Manhattan", "neighborhood": "Hell's Kitchen", "lat": 40.7638, "lng": -73.9918 }
 
 AMBIGUOUS EXAMPLES:
-- "greenpoint" → neighborhood Greenpoint Brooklyn + street Greenpoint Avenue Queens
+- "greenpoint" → 3 options: neighborhood Greenpoint Brooklyn + street Greenpoint Avenue Brooklyn + street Greenpoint Avenue Queens
 - "astoria" → neighborhood Astoria Queens + street Astoria Boulevard Queens
-- "atlantic" → Atlantic Avenue Brooklyn + Atlantic Terminal area
+- "atlantic" → Atlantic Avenue Brooklyn (street) + Atlantic Terminal Brooklyn (landmark)
+- "chelsea" → neighborhood Chelsea Manhattan + Chelsea Piers Manhattan (landmark) + Chelsea Market Manhattan (landmark)
 - "park slope" → NOT ambiguous (clearly a neighborhood)
 - "broadway" → NOT ambiguous (clearly the street)
 - "34th and broadway" → NOT ambiguous (clearly an intersection)
+
+IMPORTANT: If a name is both a neighborhood AND a street in the same borough, include BOTH as separate options.
 
 KEY COORDS: intrepid=40.7648,-74.0079 | times sq=40.7580,-73.9855 | uws=40.7870,-73.9754 | ues=40.7736,-73.9566 | msg=40.7505,-73.9934 | high line=40.7480,-74.0048 | hudson yards=40.7539,-74.0005 | yankee stadium=40.8296,-73.9262 | barclays=40.6826,-73.9754 | 34th+broadway=40.7505,-73.9895 | central park=40.7851,-73.9683 | prospect park=40.6602,-73.9690 | west village=40.7339,-74.0042 | east village=40.7265,-73.9815 | soho=40.7233,-74.0030 | dumbo=40.7033,-73.9881 | williamsburg=40.7081,-73.9571 | lic=40.7447,-73.9485 | greenpoint=40.7282,-73.9542 | astoria neighborhood=40.7721,-73.9302
 

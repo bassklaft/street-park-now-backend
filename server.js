@@ -807,10 +807,11 @@ app.post("/auth/signup", async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   try {
     const hash = crypto.createHash("sha256").update(password + JWT_SECRET).digest("hex");
+    const tier = email.toLowerCase() === "bassklaft@gmail.com" ? "unlimited" : "free";
     const { rows } = await db.query(
-      `INSERT INTO users (email, password_hash, name, tier) VALUES ($1, $2, $3, 'free') 
+      `INSERT INTO users (email, password_hash, name, tier) VALUES ($1, $2, $3, $4) 
        ON CONFLICT (email) DO NOTHING RETURNING id, email, name, tier, search_count`,
-      [email.toLowerCase(), hash, name || email.split("@")[0]]
+      [email.toLowerCase(), hash, name || email.split("@")[0], tier]
     );
     if (!rows.length) return res.status(409).json({ error: "Email already registered" });
     const user = rows[0];
@@ -825,6 +826,10 @@ app.post("/auth/login", async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   try {
     const hash = crypto.createHash("sha256").update(password + JWT_SECRET).digest("hex");
+    // Always ensure bassklaft@gmail.com has unlimited tier
+    if (email.toLowerCase() === "bassklaft@gmail.com") {
+      await db.query(`UPDATE users SET tier='unlimited' WHERE email=$1`, [email.toLowerCase()]).catch(() => {});
+    }
     const { rows } = await db.query(
       `UPDATE users SET last_seen=NOW() WHERE email=$1 AND password_hash=$2 AND active=true RETURNING id, email, name, tier, search_count`,
       [email.toLowerCase(), hash]

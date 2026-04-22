@@ -69,6 +69,76 @@ function haversineKm(lat1, lng1, lat2, lng2) {
   return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
 }
 
+// ─── GET REAL STREETS FOR A NEIGHBORHOOD VIA OSM BOUNDARY ───────────────────
+async function getNeighborhoodStreets(neighborhoodName, lat, lng) {
+  try {
+    // Step 1: Find the official neighborhood boundary in OSM by name
+    const boundaryQuery = `
+      [out:json][timeout:20];
+      (
+        relation["boundary"="administrative"]["name"~"${neighborhoodName}",i]["admin_level"~"^(8|9|10|11)$"](around:2000,${lat},${lng});
+        relation["place"~"^(neighbourhood|quarter|suburb)$"]["name"~"${neighborhoodName}",i](around:2000,${lat},${lng});
+      );
+      out ids;
+    `;
+    const br = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(boundaryQuery)}`, {
+      headers: { "User-Agent": "MoveMyCar/1.0" }
+    });
+
+    let streets = [];
+
+    if (br.ok) {
+      const bd = await br.json();
+      const relations = bd.elements || [];
+
+      if (relations.length > 0) {
+        // Step 2: Get all streets INSIDE the boundary polygon
+        const relId = relations[0].id;
+        const streetsQuery = `
+          [out:json][timeout:25];
+          area(id:${3600000000 + relId})->.a;
+          way(area.a)["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street|pedestrian|trunk)$"]["name"];
+          out tags;
+        `;
+        const sr = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(streetsQuery)}`, {
+          headers: { "User-Agent": "MoveMyCar/1.0" }
+        });
+        if (sr.ok) {
+          const sd = await sr.json();
+          streets = [...new Set(
+            (sd.elements || []).map(w => w.tags?.name?.toUpperCase()).filter(Boolean)
+          )].sort();
+          console.log(`OSM boundary for "${neighborhoodName}": ${streets.length} streets`);
+        }
+      }
+    }
+
+    // Fallback: if no boundary found, use a tighter radius
+    if (streets.length === 0) {
+      console.log(`No OSM boundary for "${neighborhoodName}", using radius fallback`);
+      const fallbackQuery = `
+        [out:json][timeout:15];
+        way(around:600,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street|pedestrian)$"]["name"];
+        out tags;
+      `;
+      const fr = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(fallbackQuery)}`, {
+        headers: { "User-Agent": "MoveMyCar/1.0" }
+      });
+      if (fr.ok) {
+        const fd = await fr.json();
+        streets = [...new Set(
+          (fd.elements || []).map(w => w.tags?.name?.toUpperCase()).filter(Boolean)
+        )].sort();
+      }
+    }
+
+    return streets;
+  } catch(e) {
+    console.error("OSM neighborhood streets error:", e.message);
+    return [];
+  }
+}
+
 // ─── SMART GEOCODE ────────────────────────────────────────────────────────────
 app.get("/api/geocode", async (req, res) => {
   const { q, userLat, userLng } = req.query;
@@ -149,6 +219,31 @@ AMBIGUOUS EXAMPLES (cross-city):
 - "georgetown" → ambiguous: neighborhood DC + neighborhood Seattle
 - "mission" → ambiguous: neighborhood SF (Mission District) + could be other cities
 
+NEIGHBORHOOD EXAMPLES — ALWAYS return as neighborhood type with ALL streets listed in neighborhoodStreets:
+- "west village" → neighborhood Manhattan: BANK ST, BARROW ST, BEDFORD ST, BETHUNE ST, CHARLES ST, CHRISTOPHER ST, CLARKSON ST, COMMERCE ST, CORNELIA ST, GROVE ST, HORATIO ST, HUDSON ST, JANE ST, LEROY ST, MORTON ST, PERRY ST, TENTH AVENUE, WASHINGTON ST, WEST 10 STREET, WEST 11 STREET, WEST 12 STREET, WEST 4 STREET, WEST STREET
+- "east village" → neighborhood Manhattan with all streets
+- "brooklyn heights" → neighborhood Brooklyn with all streets
+- "park slope" → neighborhood Brooklyn with all streets
+- "upper west side" → neighborhood Manhattan with all streets
+- "hell's kitchen" → neighborhood Manhattan with all streets
+- "greenwich village" → neighborhood Manhattan with all streets
+- "soho" → neighborhood Manhattan with all streets
+- "tribeca" → neighborhood Manhattan with all streets
+- "dumbo" → neighborhood Brooklyn with all streets
+- "williamsburg" → neighborhood Brooklyn with all streets
+- "bushwick" → neighborhood Brooklyn with all streets
+- "wicker park" → neighborhood Chicago with all streets
+- "logan square" → neighborhood Chicago with all streets
+- "silver lake" → neighborhood LA with all streets
+- "echo park" → neighborhood LA with all streets
+- "mission district" → neighborhood SF with all streets
+- "haight ashbury" → neighborhood SF with all streets
+- "capitol hill" → neighborhood Seattle with all streets
+- "adams morgan" → neighborhood DC with all streets
+- "south end" → neighborhood Boston with all streets
+- "fishtown" → neighborhood Philadelphia with all streets
+- "northern liberties" → neighborhood Philadelphia with all streets
+
 LOCATION EXAMPLES (landmarks/plazas/squares — return as location type with coords):
 - "court square" → location in LIC Queens, lat=40.7472, lng=-73.9454
 - "times square" → location Manhattan, lat=40.7580, lng=-73.9855
@@ -163,24 +258,24 @@ Return ONLY the JSON, no markdown.`, 3000);
 
     if (loc.type === "ambiguous") return res.json({ ...loc, originalQuery: q });
 
-    // Neighborhood — treat like zip but with neighborhoodStreets
+    // Neighborhood — get real streets from OpenStreetMap
     if (loc.type === "neighborhood" || loc.isNeighborhood) {
-      const streets = (loc.neighborhoodStreets || loc.zipStreets || []).sort();
-      console.log(`Neighborhood "${q}": ${streets.length} streets`);
-      if (streets.length === 0) {
-        // Claude didn't return streets — ask again specifically for streets
-        try {
-          const streetsRaw = await askClaude(`List ALL streets in the ${q} neighborhood. Return ONLY a JSON array of street names in ALL CAPS, alphabetically sorted. Example: ["ATLANTIC AVENUE","CLINTON STREET","COURT STREET"]. Return ONLY the array.`, 1500);
-          const match = streetsRaw.match(/\[[\s\S]*\]/);
-          if (match) {
-            const parsed = JSON.parse(match[0]);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              return res.json({ ...loc, isNeighborhood: true, isZip: false, isPark: false, isEstablishment: false, zipStreets: parsed.sort(), originalQuery: q });
-            }
-          }
-        } catch(e) { console.error("Neighborhood streets retry error:", e.message); }
-      }
+      const streets = await getNeighborhoodStreets(q, loc.lat, loc.lng);
+      console.log(`Neighborhood "${q}": ${streets.length} streets from OSM`);
       return res.json({ ...loc, isNeighborhood: true, isZip: false, isPark: false, isEstablishment: false, zipStreets: streets, originalQuery: q });
+    }
+
+    // If Claude returned a location but it's a well-known neighborhood name, treat as neighborhood
+    if (loc.type === "location" && loc.lat) {
+      const neighborhoodKeywords = /village|heights|slope|park|hill|garden|square|place|town|side|point|field|wood|grove|bridge|haven|beach|bay|harbor|quarter|district|corridor|triangle|oval|circle|loop|row|mish|haight|dumbo|soho|tribeca|noho|nolita|bushwick|williamsburg|astoria|flushing|sunnyside/i;
+      const isLikelyNeighborhood = neighborhoodKeywords.test(q) && !q.match(/^\d+/) && !q.includes("&") && q.split(" ").length <= 4;
+      if (isLikelyNeighborhood) {
+        console.log(`Treating "${q}" as neighborhood, fetching OSM streets`);
+        const streets = await getNeighborhoodStreets(q, loc.lat, loc.lng);
+        if (streets.length > 0) {
+          return res.json({ ...loc, isNeighborhood: true, isZip: false, isPark: false, isEstablishment: false, zipStreets: streets, originalQuery: q });
+        }
+      }
     }
 
     if (loc.isEstablishment && loc.establishments?.length > 0 && userLat && userLng) {

@@ -1,5 +1,5 @@
 /**
- * Street Park Info — Backend
+ * Move My Car — Backend
  * Claude-powered NYC parking intelligence
  */
 
@@ -74,6 +74,43 @@ app.get("/api/geocode", async (req, res) => {
   const { q, userLat, userLng } = req.query;
   if (!q) return res.status(400).json({ error: "q required" });
 
+  const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
+
+  // ── STEP 1: If it looks like a full address, go straight to Google ────────
+  const looksLikeAddress = /^\d+\s+\w/.test(q.trim());
+  if (looksLikeAddress && GOOGLE_KEY) {
+    try {
+      const stripped = q.replace(/\s*(apt|apartment|unit|suite|ste|fl|floor|#)\s*[\w-]+/gi, "").replace(/\(.*?\)/g, "").trim();
+      const gUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(stripped)}&key=${GOOGLE_KEY}&region=us&components=country:US`;
+      const gr = await fetch(gUrl);
+      if (gr.ok) {
+        const gd = await gr.json();
+        if (gd.status === "OK" && gd.results?.length > 0) {
+          const result = gd.results[0];
+          const loc = result.geometry.location;
+          const lat = loc.lat, lng = loc.lng;
+          const comps = result.address_components || [];
+          const get = (type) => comps.find(c => c.types.includes(type))?.long_name || "";
+          const street = (get("route") || q).toUpperCase();
+          const neighborhood = get("neighborhood") || get("sublocality_level_2") || "";
+          const borough = get("sublocality_level_1") || get("sublocality") || "";
+          const city = get("locality") || "";
+          const label = result.formatted_address?.split(",").slice(0,2).join(",") || q;
+
+          // Get nearby streets sorted by proximity
+          let nearbyStreets = [street];
+          try {
+            const raw = await askClaude(`Urban geography expert. Coordinates lat=${lat}, lng=${lng} in ${neighborhood || borough || city}. List 12 nearest streets sorted closest to farthest. Primary street: "${street}". Return ONLY a JSON array of street names in ALL CAPS.`, 800);
+            const match = raw.match(/\[[\s\S]*\]/);
+            if (match) { const parsed = JSON.parse(match[0]); if (Array.isArray(parsed) && parsed.length > 0) nearbyStreets = parsed; }
+          } catch(e) {}
+
+          return res.json({ type:"location", isGPS:true, isEstablishment:false, isPark:false, isZip:false, street, borough, neighborhood, city, label, originalQuery:q, lat, lng, nearbyStreets });
+        }
+      }
+    } catch(e) { console.error("Google address geocode error:", e.message); }
+  }
+
   let raw = "";
   try {
     raw = await askClaude(`You are a US urban geography and parking expert covering all major cities. A driver typed: "${q}"
@@ -112,6 +149,14 @@ AMBIGUOUS EXAMPLES (cross-city):
 - "georgetown" → ambiguous: neighborhood DC + neighborhood Seattle
 - "mission" → ambiguous: neighborhood SF (Mission District) + could be other cities
 
+LOCATION EXAMPLES (landmarks/plazas/squares — return as location type with coords):
+- "court square" → location in LIC Queens, lat=40.7472, lng=-73.9454
+- "times square" → location Manhattan, lat=40.7580, lng=-73.9855
+- "union square" → location Manhattan OR SF depending on context
+- "the met" → establishment (Metropolitan Museum) on 5th Ave Manhattan
+- "wrigley field" → establishment in Chicago
+- "grand army plaza" → location Brooklyn, lat=40.6742, lng=-73.9700
+
 Return ONLY the JSON, no markdown.`, 3000);
 
     const loc = JSON.parse(raw.replace(/```json|```/g,"").trim());
@@ -141,6 +186,23 @@ Return ONLY the JSON, no markdown.`, 3000);
     if (loc.isEstablishment && loc.establishments?.length > 0 && userLat && userLng) {
       const uLat = parseFloat(userLat), uLng = parseFloat(userLng);
       loc.establishments.sort((a,b) => haversineKm(uLat,uLng,a.lat,a.lng) - haversineKm(uLat,uLng,b.lat,b.lng));
+    }
+
+    // For single locations (landmarks, plazas, intersections), return nearby streets
+    if (!loc.isEstablishment && !loc.isPark && !loc.isZip && loc.lat && loc.lng) {
+      try {
+        const raw = await askClaude(`You are an urban geography expert. Given coordinates lat=${loc.lat}, lng=${loc.lng} near "${q}" (${loc.neighborhood || loc.borough || loc.city || ""}), list the 12 nearest streets sorted closest to farthest. The primary street is "${loc.street}".
+
+Return ONLY a JSON array of street names in ALL CAPS. Include cross streets and parallel streets within a 6-block radius.
+Return ONLY the array.`, 1000);
+        const match = raw.match(/\[[\s\S]*\]/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return res.json({ ...loc, isGPS: true, nearbyStreets: parsed, originalQuery: q });
+          }
+        }
+      } catch(e) { console.error("Nearby streets for location error:", e.message); }
     }
 
     if (loc.isEstablishment || loc.isPark || loc.isZip || loc.lat) {
@@ -557,7 +619,7 @@ app.post("/subscribe", async (req, res) => {
   const e164 = digits.startsWith("1") ? `+${digits}` : `+1${digits}`;
   try {
     await db.query(`INSERT INTO subscribers (phone,street,borough,lat,lng) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (phone) DO UPDATE SET street=$2,borough=$3,lat=$4,lng=$5,active=true`, [e164,street.toUpperCase(),borough||"",lat||null,lng||null]);
-    await twilioClient.messages.create({ body:`🚗 Street Park Info activated for ${street}! We'll text you before street cleaning, film shoots, and bad weather. Reply STOP to cancel.`, from:process.env.TWILIO_PHONE_NUMBER, to:e164 });
+    await twilioClient.messages.create({ body:`🚗 Move My Car activated for ${street}! We'll text you before street cleaning, film shoots, and bad weather. Reply STOP to cancel.`, from:process.env.TWILIO_PHONE_NUMBER, to:e164 });
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -610,7 +672,7 @@ async function sendNightlyAlerts() {
       if ([71,73,75,77,85,86].includes(code)&&snow>0.5) msgs.push(`❄️ Snow tomorrow (${snow.toFixed(1)}"). Move your car early.`);
       else if ([61,63,65,80,81,82].includes(code)&&rain>0.5) msgs.push(`🌧️ Heavy rain tomorrow. Street cleaning may still be enforced.`);
       else if ([95,96,99].includes(code)) msgs.push(`⛈️ Thunderstorms tomorrow. Check parking rules.`);
-      if (msgs.length) await twilioClient.messages.create({ body:`Street Park Info — ${tomorrowStr}:\n\n${msgs.join("\n\n")}\n\nReply STOP to cancel.`, from:process.env.TWILIO_PHONE_NUMBER, to:sub.phone });
+      if (msgs.length) await twilioClient.messages.create({ body:`Move My Car — ${tomorrowStr}:\n\n${msgs.join("\n\n")}\n\nReply STOP to cancel.`, from:process.env.TWILIO_PHONE_NUMBER, to:sub.phone });
     } catch (err) { console.error(`Alert failed for ${sub.phone}:`, err.message); }
     await new Promise(r=>setTimeout(r,150));
   }
@@ -639,4 +701,4 @@ async function initDB() {
   console.log("✅ DB ready");
 }
 
-initDB().then(() => app.listen(PORT, () => console.log(`🚗 Street Park Info running on port ${PORT}`)));
+initDB().then(() => app.listen(PORT, () => console.log(`🚗 Move My Car running on port ${PORT}`)));

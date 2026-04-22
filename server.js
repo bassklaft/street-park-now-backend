@@ -148,39 +148,39 @@ Return ONLY the JSON, no markdown.`, 3000);
     }
   } catch (e) { console.error("Claude geocode error:", e.message); }
 
-  // Nominatim fallback — search all supported cities
+  // Google Geocoding API — handles landmarks, abbreviations, full addresses, neighborhoods
   try {
-    // Clean address: strip apt/unit/floor, then keep only street + city/state
     let stripped = q
       .replace(/\s*(apt|apartment|unit|suite|ste|fl|floor|#)\s*[\w-]+/gi, "")
-      .replace(/\s+\d{4,5}(\s|$)/g, " ") // remove zip codes
-      .replace(/,?\s*(il|ny|ca|ma|pa|dc|wa|tx|fl)\b.*/gi, "") // remove state + everything after
+      .replace(/\(.*?\)/g, "")
       .trim();
-    // Also strip anything in parentheses
-    stripped = stripped.replace(/\(.*?\)/g, "").trim();
-    const majorCities = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island|los angeles|la |chicago|san francisco|sf |boston|philadelphia|philly|washington dc|seattle/i;
-    const withCity = majorCities.test(stripped) ? stripped : `${stripped}, United States`;
-    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(withCity)}&format=json&limit=1&addressdetails=1&countrycodes=us`;
-    const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
-    if (r.ok) {
-      const data = await r.json();
-      if (data.length > 0) {
-        const item = data[0], addr = item.address || {};
-        const lat = parseFloat(item.lat), lng = parseFloat(item.lon);
-        const city = addr.city || addr.town || addr.county || "";
-        const street = (addr.road || addr.pedestrian || addr.suburb || q).toUpperCase();
-        const borough = addr.borough || addr.city_district || addr.suburb || "";
-        const neighborhood = addr.neighbourhood || addr.suburb || "";
 
-        // If query looks like a street address (starts with number), treat like GPS
-        const isAddress = /^\d+\s+\w/.test(stripped.trim());
+    const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
+    const gUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(stripped)}&key=${GOOGLE_KEY}&region=us&components=country:US`;
+    const gr = await fetch(gUrl);
+    if (gr.ok) {
+      const gd = await gr.json();
+      if (gd.status === "OK" && gd.results?.length > 0) {
+        const result = gd.results[0];
+        const loc = result.geometry.location;
+        const lat = loc.lat, lng = loc.lng;
+        const comps = result.address_components || [];
+        const get = (type) => comps.find(c => c.types.includes(type))?.long_name || "";
+        const street = (get("route") || q).toUpperCase();
+        const streetNum = get("street_number");
+        const neighborhood = get("neighborhood") || get("sublocality_level_2") || "";
+        const borough = get("sublocality_level_1") || get("sublocality") || "";
+        const city = get("locality") || "";
+        const label = result.formatted_address?.split(",").slice(0,2).join(",") || q;
+
+        // If it's a street address, return surrounding streets sorted by proximity
+        const isAddress = /^\d+\s+\w/.test(stripped.trim()) || !!streetNum;
         if (isAddress) {
-          // Get nearby streets via the same logic as reverse-geocode
           let nearbyStreets = [street];
           try {
             const raw = await askClaude(`You are an urban geography expert. Given coordinates lat=${lat}, lng=${lng} in ${neighborhood || borough || city}, list the 12 nearest streets sorted closest to farthest. The primary street is "${street}".
 
-Return ONLY a JSON array of street names in ALL CAPS. Include cross streets and parallel streets within about a 6-block radius.
+Return ONLY a JSON array of street names in ALL CAPS. Include cross streets and parallel streets within a 6-block radius.
 Return ONLY the array.`, 1000);
             const match = raw.match(/\[[\s\S]*\]/);
             if (match) {
@@ -191,38 +191,43 @@ Return ONLY the array.`, 1000);
 
           return res.json({
             type: "location", isGPS: true, isEstablishment: false, isPark: false, isZip: false,
-            street, borough, neighborhood, city,
-            label: q, originalQuery: q, lat, lng,
-            nearbyStreets,
+            street, borough, neighborhood, city, label, originalQuery: q, lat, lng, nearbyStreets,
           });
         }
 
-        return res.json({ type:"location", isEstablishment:false, isPark:false, isZip:false, street, borough, neighborhood, city, label:q, originalQuery:q, lat, lng });
+        return res.json({ type:"location", isEstablishment:false, isPark:false, isZip:false, street, borough, neighborhood, city, label, originalQuery:q, lat, lng });
       }
     }
-  } catch (e) { console.error("Nominatim error:", e.message); }
+  } catch (e) { console.error("Google geocode error:", e.message); }
 
   res.status(404).json({ error: `Couldn't find "${q}". Try a street name, zip code, or neighborhood in NYC, LA, Chicago, SF, Boston, Philadelphia, DC, or Seattle.` });
 });
 
-// Reverse geocode — also returns nearby streets sorted by distance
+// Reverse geocode — uses Google for accuracy, returns nearby streets sorted by distance
 app.get("/api/reverse-geocode", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.status(400).json({ error: "lat and lng required" });
 
-  let primaryStreet = "", borough = "", neighborhood = "", label = "";
+  let primaryStreet = "", borough = "", neighborhood = "", label = "", city = "";
 
   try {
-    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
-    const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
+    const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${GOOGLE_KEY}`;
+    const r = await fetch(url);
     if (r.ok) {
-      const item = await r.json(), addr = item.address || {};
-      primaryStreet = (addr.road || addr.pedestrian || addr.footway || "").toUpperCase();
-      borough      = addr.borough || addr.city_district || addr.suburb || "";
-      neighborhood = addr.neighbourhood || addr.suburb || "";
-      label        = item.display_name?.split(",").slice(0,2).join(",") || "";
+      const data = await r.json();
+      if (data.status === "OK" && data.results?.length > 0) {
+        const result = data.results[0];
+        const comps = result.address_components || [];
+        const get = (type) => comps.find(c => c.types.includes(type))?.long_name || "";
+        primaryStreet = get("route").toUpperCase();
+        borough       = get("sublocality_level_1") || get("sublocality") || "";
+        neighborhood  = get("neighborhood") || get("sublocality_level_2") || "";
+        city          = get("locality") || "";
+        label         = result.formatted_address?.split(",").slice(0,2).join(",") || "";
+      }
     }
-  } catch (e) { console.error("Reverse geocode error:", e.message); }
+  } catch (e) { console.error("Google reverse geocode error:", e.message); }
 
   if (!primaryStreet) return res.status(502).json({ error: "Could not identify your street" });
 
@@ -247,7 +252,7 @@ Return ONLY the JSON array.`, 1000);
 
   return res.json({
     street: primaryStreet,
-    borough, neighborhood, label,
+    borough, neighborhood, city, label,
     lat: parseFloat(lat), lng: parseFloat(lng),
     isGPS: true,
     nearbyStreets,

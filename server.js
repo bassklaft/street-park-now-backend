@@ -150,8 +150,16 @@ Return ONLY the JSON, no markdown.`, 3000);
 
   // Nominatim fallback — search all supported cities
   try {
+    // Clean address: strip apt/unit/floor, then keep only street + city/state
+    let stripped = q
+      .replace(/\s*(apt|apartment|unit|suite|ste|fl|floor|#)\s*[\w-]+/gi, "")
+      .replace(/\s+\d{4,5}(\s|$)/g, " ") // remove zip codes
+      .replace(/,?\s*(il|ny|ca|ma|pa|dc|wa|tx|fl)\b.*/gi, "") // remove state + everything after
+      .trim();
+    // Also strip anything in parentheses
+    stripped = stripped.replace(/\(.*?\)/g, "").trim();
     const majorCities = /new york|nyc|brooklyn|manhattan|bronx|queens|staten island|los angeles|la |chicago|san francisco|sf |boston|philadelphia|philly|washington dc|seattle/i;
-    const withCity = majorCities.test(q) ? q : `${q}, United States`;
+    const withCity = majorCities.test(stripped) ? stripped : `${stripped}, United States`;
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(withCity)}&format=json&limit=1&addressdetails=1&countrycodes=us`;
     const r = await fetch(url, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
     if (r.ok) {
@@ -165,8 +173,7 @@ Return ONLY the JSON, no markdown.`, 3000);
         const neighborhood = addr.neighbourhood || addr.suburb || "";
 
         // If query looks like a street address (starts with number), treat like GPS
-        // and return surrounding streets sorted by proximity
-        const isAddress = /^\d+\s+\w/.test(q.trim());
+        const isAddress = /^\d+\s+\w/.test(stripped.trim());
         if (isAddress) {
           // Get nearby streets via the same logic as reverse-geocode
           let nearbyStreets = [street];

@@ -632,18 +632,18 @@ async function fetchOverpass(query) {
   return null;
 }
 
-// ─── PARKING HEAT MAP — Claude generates street list, Google geocodes them ────
+// ─── PARKING HEAT MAP — real street geometries from OpenStreetMap ─────────────
 app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
   const cacheKey = `${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
-  // 1. In-memory cache
+  // In-memory cache
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
 
-  // 2. DB cache
+  // DB cache
   try {
     const { rows } = await db.query("SELECT data FROM heatmap_cache WHERE cache_key=$1 AND updated_at > NOW() - INTERVAL '24 hours'", [cacheKey]);
     if (rows.length > 0) {
@@ -654,75 +654,59 @@ app.get("/api/heatmap", async (req, res) => {
   } catch(e) {}
 
   try {
-    const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
+    const overpassQuery = `[out:json][timeout:15];way(around:400,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street)$"]["name"];out geom;`;
+    const r = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`, {
+      headers: { "User-Agent": "StreetParkNow/1.0 (streetparknow.vercel.app)" }
+    });
+    if (!r.ok) { console.error("Overpass status:", r.status); return res.json([]); }
+    const data = await r.json();
+    const ways = (data.elements || []).filter(w => w.tags?.name && w.geometry?.length > 1);
 
-    // Ask Claude for nearby streets + their cleaning schedules in one call
-    const raw = await askClaude(`You are a US parking expert. For coordinates lat=${lat}, lng=${lng}:
+    const streetNames = [...new Set(ways.map(w => w.tags.name.toUpperCase()))].slice(0, 20);
+    if (!streetNames.length) return res.json([]);
 
-1. Identify the city and neighborhood
-2. List 15 nearby street names (real streets in that area)
-3. For each street, provide alternate side parking schedule if known
+    const schedulesRaw = await askClaude(`NYC alternate side parking schedules near lat=${lat}, lng=${lng}.
+Streets:
+${streetNames.map((s,i) => `${i+1}. ${s}`).join("\n")}
+Return ONLY a JSON object. Key = street name in CAPS, value = array of schedules (empty array if unknown).
+{"BEDFORD AVENUE":[{"days":["Mon","Thu"],"time":"8 AM - 9:30 AM"}],"BERRY STREET":[]}
+Return ONLY the JSON object:`, 2000);
 
-Return ONLY this JSON:
-{
-  "streets": [
-    {"name": "BEDFORD AVENUE", "days": ["Mon","Thu"], "time": "8 AM - 9:30 AM"},
-    {"name": "BERRY STREET", "days": ["Tue","Fri"], "time": "8 AM - 9:30 AM"},
-    {"name": "WYTHE AVENUE", "days": [], "time": ""}
-  ]
-}
-Return ONLY the JSON object.`, 2000);
-
-    let streets = [];
-    try {
-      const m = raw.match(/\{[\s\S]*\}/);
-      if (m) streets = JSON.parse(m[0]).streets || [];
-    } catch(e) { console.error("Claude heatmap parse error:", e.message); }
-
-    if (!streets.length) return res.json([]);
+    let schedules = {};
+    try { const m = schedulesRaw.match(/\{[\s\S]*\}/); if (m) schedules = JSON.parse(m[0]); } catch(e) {}
 
     const today    = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
     const tomorrow = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+86400000).getDay()];
     const in2days  = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+172800000).getDay()];
     const in3days  = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+259200000).getDay()];
 
-    // Geocode each street to get coordinates using Google
-    const result = await Promise.all(streets.map(async (s) => {
-      try {
-        const addr = `${s.name}, near ${lat},${lng}`;
-        const gUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(addr)}&location=${lat},${lng}&radius=2000&key=${GOOGLE_KEY}`;
-        const gr = await fetch(gUrl);
-        if (!gr.ok) return null;
-        const gd = await gr.json();
-        if (!gd.results?.[0]) return null;
-        const loc = gd.results[0].geometry.location;
-        // Create a short line segment along the street
-        const coords = [
-          [loc.lat - 0.0005, loc.lng - 0.0005],
-          [loc.lat, loc.lng],
-          [loc.lat + 0.0005, loc.lng + 0.0005],
-        ];
+    const result = ways.map(w => {
+      const name = w.tags.name.toUpperCase();
+      const sch = schedules[name] || [];
+      const coords = w.geometry.map(p => [p.lat, p.lon]);
+      let urgency = sch.length ? "green" : "gray";
+      let nextClean = null;
+      for (const s of sch) {
         const days = s.days || [];
-        let urgency = days.length ? "green" : "gray";
-        let nextClean = null;
-        if (days.includes(today)) { urgency = "red"; nextClean = `Today ${s.time||""}`.trim(); }
-        else if (days.includes(tomorrow)) { urgency = "red"; nextClean = `Tomorrow ${s.time||""}`.trim(); }
-        else if (days.includes(in2days) || days.includes(in3days)) { urgency = "yellow"; nextClean = `In 2-3 days ${s.time||""}`.trim(); }
-        return { street: s.name, coords, urgency, nextClean };
-      } catch(e) { return null; }
-    }));
+        if (days.includes(today))    { urgency = "red";    nextClean = `Today ${s.time||""}`.trim(); break; }
+        if (days.includes(tomorrow)) { urgency = "red";    nextClean = `Tomorrow ${s.time||""}`.trim(); break; }
+        if (days.includes(in2days) || days.includes(in3days)) {
+          if (urgency !== "red") { urgency = "yellow"; nextClean = `In 2-3 days ${s.time||""}`.trim(); }
+        }
+      }
+      return { street: name, coords, urgency, nextClean };
+    });
 
-    const filtered = result.filter(Boolean);
-    heatmapCache.set(cacheKey, { data: filtered, ts: Date.now() });
+    heatmapCache.set(cacheKey, { data: result, ts: Date.now() });
     try {
       await db.query(
         `INSERT INTO heatmap_cache (cache_key, data) VALUES ($1, $2) ON CONFLICT (cache_key) DO UPDATE SET data=$2, updated_at=NOW()`,
-        [cacheKey, JSON.stringify(filtered)]
+        [cacheKey, JSON.stringify(result)]
       );
     } catch(e) {}
 
-    console.log(`Heatmap: ${filtered.length} streets via Claude+Google`);
-    res.json(filtered);
+    console.log(`Heatmap: ${result.length} streets`);
+    res.json(result);
   } catch(e) { console.error("Heatmap error:", e.message); res.json([]); }
 });
 

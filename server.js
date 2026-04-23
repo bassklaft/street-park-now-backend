@@ -630,9 +630,49 @@ Return ONLY the JSON object starting with {:`, 3000);
       for (const [street, schedules] of Object.entries(data)) {
         result[street] = (schedules || []).map(s => ({ ...s, upcomingDates: getUpcomingDates(s.days || []) }));
       }
+
+      // For any streets Claude returned empty, try Socrata DOT data
+      const emptyStreets = streets.filter(s => !result[s] || result[s].length === 0);
+      if (emptyStreets.length > 0) {
+        await Promise.all(emptyStreets.map(async street => {
+          try {
+            const name = street.toUpperCase().trim();
+            const r = await fetch(`${SOCRATA}/xswq-wnv9.json?$where=upper(street)%20LIKE%20'%25${encodeURIComponent(name)}%25'&$limit=50`);
+            if (!r.ok) return;
+            const raw = await r.json();
+            const parsed = raw.map(row => {
+              const p = parseSignText(row.signdesc || row.description || "");
+              if (!p || !p.days.length) return null;
+              return { days: p.days, time: p.time, side: row.side_of_street || "", raw: p.raw, upcomingDates: getUpcomingDates(p.days) };
+            }).filter(Boolean);
+            if (parsed.length > 0) result[street] = parsed;
+          } catch(e) {}
+        }));
+      }
+
       return res.json(result);
     }
   } catch(e) { console.error("Batch cleaning error:", e.message); }
+
+  // Full Socrata fallback if Claude fails entirely
+  try {
+    const result = {};
+    await Promise.all(streets.map(async street => {
+      try {
+        const name = street.toUpperCase().trim();
+        const r = await fetch(`${SOCRATA}/xswq-wnv9.json?$where=upper(street)%20LIKE%20'%25${encodeURIComponent(name)}%25'&$limit=50`);
+        if (!r.ok) return;
+        const raw = await r.json();
+        const parsed = raw.map(row => {
+          const p = parseSignText(row.signdesc || row.description || "");
+          if (!p || !p.days.length) return null;
+          return { days: p.days, time: p.time, side: row.side_of_street || "", raw: p.raw, upcomingDates: getUpcomingDates(p.days) };
+        }).filter(Boolean);
+        result[street] = parsed;
+      } catch(e) {}
+    }));
+    return res.json(result);
+  } catch(e) { console.error("Batch Socrata fallback error:", e.message); }
 
   res.json({});
 });

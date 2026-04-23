@@ -342,7 +342,15 @@ app.get("/api/geocode", async (req, res) => {
       if (gr.ok) {
         const gd = await gr.json();
         if (gd.status === "OK" && gd.results?.length > 0) {
-          const result = gd.results[0];
+          // Filter to US or Canada results only
+          const usResult = gd.results.find(r => {
+            const c = r.address_components?.find(c => c.types.includes("country"))?.short_name;
+            return ["US", "CA"].includes(c);
+          });
+          if (!usResult) {
+            console.log(`Google geocode "${q}": no US/CA result, falling through`);
+          } else {
+          const result = usResult;
           const { lat, lng } = result.geometry.location;
           const comps = result.address_components || [];
           const get = (type) => comps.find(c => c.types.includes(type))?.long_name || "";
@@ -384,6 +392,7 @@ app.get("/api/geocode", async (req, res) => {
           // For everything else — establishments, landmarks, addresses, parks
           // Always return nearby streets so user is never stranded
           return res.json({ type:"location", isGPS:true, isNeighborhood:false, isZip:false, isPark:false, isEstablishment:false, label, street, borough, neighborhood, city, state, lat, lng, nearbyStreets:streets.length > 0 ? streets : [street].filter(Boolean), originalQuery:q });
+          } // end usResult
         }
       }
     } catch(e) { console.error("Google geocode error:", e.message); }

@@ -241,14 +241,14 @@ async function getNeighborhoodStreets(name, lat, lng) {
   const boundaryPromise = (async () => {
     try {
       const boundaryQuery = `[out:json][timeout:20];(relation["boundary"="administrative"]["name"~"${cleanName}",i](around:2000,${lat},${lng});relation["place"~"^(neighbourhood|quarter|suburb|district|city_block)$"]["name"~"${cleanName}",i](around:2000,${lat},${lng}););out ids;`;
-      const br = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(boundaryQuery)}`,{headers:{"User-Agent":"StreetParkNow/1.0"}});
+      const br = await fetch('https://overpass-api.de/api/interpreter', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','User-Agent':'StreetParkNow/1.0 (streetparknow.vercel.app; contact: support@streetparknow.app)','Accept':'application/json'},body:'data='+encodeURIComponent(boundaryQuery)});
       if (!br.ok) return [];
       const bd = await br.json();
       const relations = bd.elements || [];
       if (relations.length === 0) return [];
       const relId = relations[0].id;
       const streetsQuery = `[out:json][timeout:25];area(id:${3600000000+relId})->.a;way(area.a)["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street|pedestrian|trunk)$"]["name"];out tags;`;
-      const sr = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(streetsQuery)}`,{headers:{"User-Agent":"StreetParkNow/1.0"}});
+      const sr = await fetch('https://overpass-api.de/api/interpreter', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','User-Agent':'StreetParkNow/1.0 (streetparknow.vercel.app; contact: support@streetparknow.app)','Accept':'application/json'},body:'data='+encodeURIComponent(streetsQuery)});
       if (!sr.ok) return [];
       const sd = await sr.json();
       return [...new Set((sd.elements||[]).map(w=>w.tags?.name?.toUpperCase()).filter(Boolean))].sort();
@@ -258,7 +258,7 @@ async function getNeighborhoodStreets(name, lat, lng) {
   const radius600Promise = (async () => {
     try {
       const q = `[out:json][timeout:15];way(around:600,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street|pedestrian|trunk)$"]["name"];out tags;`;
-      const r = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(q)}`,{headers:{"User-Agent":"StreetParkNow/1.0"}});
+      const r = await fetch('https://overpass-api.de/api/interpreter', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','User-Agent':'StreetParkNow/1.0 (streetparknow.vercel.app; contact: support@streetparknow.app)','Accept':'application/json'},body:'data='+encodeURIComponent(q)});
       if (!r.ok) return [];
       const d = await r.json();
       return [...new Set((d.elements||[]).map(w=>w.tags?.name?.toUpperCase()).filter(Boolean))].sort();
@@ -268,7 +268,7 @@ async function getNeighborhoodStreets(name, lat, lng) {
   const radius1200Promise = (async () => {
     try {
       const q = `[out:json][timeout:15];way(around:1200,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street|pedestrian|trunk)$"]["name"];out tags;`;
-      const r = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(q)}`,{headers:{"User-Agent":"StreetParkNow/1.0"}});
+      const r = await fetch('https://overpass-api.de/api/interpreter', {method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','User-Agent':'StreetParkNow/1.0 (streetparknow.vercel.app; contact: support@streetparknow.app)','Accept':'application/json'},body:'data='+encodeURIComponent(q)});
       if (!r.ok) return [];
       const d = await r.json();
       return [...new Set((d.elements||[]).map(w=>w.tags?.name?.toUpperCase()).filter(Boolean))].sort();
@@ -621,11 +621,35 @@ app.get("/api/heatmap", async (req, res) => {
 
   try {
     // Step 1: Get real street geometries from Overpass API
-    const overpassQuery = `[out:json][timeout:15];way(around:400,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street)$"]["name"];out geom;`;
-    const r = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`, { headers: { "User-Agent": "StreetParkInfo/1.0" } });
-    if (!r.ok) return res.json([]);
-    const data = await r.json();
+    const overpassQuery = `[out:json][timeout:20];way(around:500,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street)$"]["name"];out geom;`;
+    
+    // Try multiple Overpass endpoints in case one is down
+    let data = null;
+    for (const endpoint of [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://overpass.openstreetmap.ru/api/interpreter",
+    ]) {
+      try {
+        const r = await fetch(endpoint, { 
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "StreetParkNow/1.0 (streetparknow.vercel.app; contact: support@streetparknow.app)",
+            "Accept": "application/json",
+          },
+          body: `data=${encodeURIComponent(overpassQuery)}`,
+          signal: AbortSignal.timeout(18000)
+        });
+        if (r.ok) { data = await r.json(); break; }
+        console.error(`Overpass ${endpoint} status: ${r.status}`);
+      } catch(e) { console.error(`Overpass ${endpoint} failed:`, e.message); }
+    }
+    
+    if (!data) { console.error("All Overpass endpoints failed"); return res.json([]); }
+    
     const ways = (data.elements || []).filter(w => w.tags?.name && w.geometry?.length > 1);
+    console.log(`Heatmap: ${ways.length} ways found near ${lat},${lng}`);
 
     // Step 2: Get unique street names
     const streetNames = [...new Set(ways.map(w => w.tags.name.toUpperCase()))].slice(0, 20);

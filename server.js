@@ -762,7 +762,7 @@ app.get("/api/heatmap", async (req, res) => {
     const ways = (data.elements || []).filter(w => w.tags?.name && w.geometry?.length > 1);
     console.log(`Overpass: ${ways.length} ways`);
 
-    const streetNames = [...new Set(ways.map(w => normStreet(w.tags.name)))].slice(0, 50);
+    const streetNames = [...new Set(ways.map(w => normStreet(w.tags.name)))].slice(0, 80);
     if (!streetNames.length) return res.json([]);
 
     const schedulesRaw = await askClaude(`You are an NYC alternate side parking expert. For each street near lat=${lat}, lng=${lng}, give the current street cleaning / alt-side parking schedule.

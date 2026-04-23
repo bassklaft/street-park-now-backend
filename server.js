@@ -296,6 +296,33 @@ app.get("/api/geocode", async (req, res) => {
     .replace(/\(.*?\)/g, "")
     .trim();
 
+  // ── STEP 0: Catalog check FIRST — instant, no API calls needed ───────────
+  const catalogStreets = lookupNeighborhoodStreets(qClean);
+  if (catalogStreets && catalogStreets.length > 0) {
+    console.log(`Catalog fast-path for "${qClean}": ${catalogStreets.length} streets`);
+    // Still need coords — use known coords from catalog or fall through to Google for coords only
+    const coordsMap = {
+      "the mission": { lat:37.7599, lng:-122.4148, label:"Mission District, San Francisco", borough:"", neighborhood:"Mission District", city:"San Francisco" },
+      "the slope": { lat:40.6681, lng:-73.9800, label:"Park Slope, Brooklyn", borough:"Brooklyn", neighborhood:"Park Slope", city:"New York" },
+      "jp": { lat:42.3100, lng:-71.1128, label:"Jamaica Plain, Boston", borough:"", neighborhood:"Jamaica Plain", city:"Boston" },
+      "tenderloin": { lat:37.7832, lng:-122.4147, label:"Tenderloin, San Francisco", borough:"", neighborhood:"Tenderloin", city:"San Francisco" },
+      "chinatown nyc": { lat:40.7158, lng:-73.9970, label:"Chinatown, Manhattan", borough:"Manhattan", neighborhood:"Chinatown", city:"New York" },
+      "chinatown manhattan": { lat:40.7158, lng:-73.9970, label:"Chinatown, Manhattan", borough:"Manhattan", neighborhood:"Chinatown", city:"New York" },
+      "k-town nyc": { lat:40.7484, lng:-73.9878, label:"Koreatown, Manhattan", borough:"Manhattan", neighborhood:"Koreatown", city:"New York" },
+      "koreatown nyc": { lat:40.7484, lng:-73.9878, label:"Koreatown, Manhattan", borough:"Manhattan", neighborhood:"Koreatown", city:"New York" },
+      "chinatown san francisco": { lat:37.7941, lng:-122.4078, label:"Chinatown, San Francisco", borough:"", neighborhood:"Chinatown", city:"San Francisco" },
+      "chinatown chicago": { lat:41.8527, lng:-87.6324, label:"Chinatown, Chicago", borough:"", neighborhood:"Chinatown", city:"Chicago" },
+      "chinatown boston": { lat:42.3497, lng:-71.0622, label:"Chinatown, Boston", borough:"", neighborhood:"Chinatown", city:"Boston" },
+      "chinatown philadelphia": { lat:39.9536, lng:-75.1573, label:"Chinatown, Philadelphia", borough:"", neighborhood:"Chinatown", city:"Philadelphia" },
+      "chinatown dc": { lat:38.9006, lng:-77.0213, label:"Chinatown, Washington DC", borough:"", neighborhood:"Chinatown", city:"Washington DC" },
+      "flushing chinatown": { lat:40.7675, lng:-73.8330, label:"Flushing, Queens", borough:"Queens", neighborhood:"Flushing", city:"New York" },
+    };
+    const coords = coordsMap[qClean.toLowerCase()] || null;
+    if (coords) {
+      return res.json({ type:"neighborhood", isNeighborhood:true, isZip:false, isPark:false, isEstablishment:false, zipStreets:catalogStreets, originalQuery:q, ...coords });
+    }
+  }
+
   // ── STEP 1: Google Places/Geocoding API — handles EVERYTHING ─────────────
   // Wrigley Field, MetLife, Court Square, West Village, 90210, The MET — all of it
   if (GOOGLE_KEY) {

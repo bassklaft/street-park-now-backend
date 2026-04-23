@@ -604,49 +604,61 @@ Return ONLY the JSON object starting with {:`, 3000);
 });
 // ─── HEATMAP CACHE ───────────────────────────────────────────────────────────
 const heatmapCache = new Map();
-const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour in memory
+
+async function fetchOverpass(query) {
+  const endpoints = [
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+  ];
+  for (const endpoint of endpoints) {
+    try {
+      const r = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": "StreetParkNow/1.0 (streetparknow.vercel.app; contact: support@streetparknow.app)",
+          "Accept": "application/json",
+        },
+        body: `data=${encodeURIComponent(query)}`,
+        signal: AbortSignal.timeout(20000),
+      });
+      if (r.ok) return await r.json();
+      console.error(`Overpass ${endpoint}: ${r.status}`);
+    } catch(e) { console.error(`Overpass ${endpoint} error:`, e.message); }
+  }
+  return null;
+}
 
 // ─── PARKING HEAT MAP — real street geometries from OpenStreetMap ─────────────
 app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  // Round to 3 decimal places (~100m grid) for cache key
   const cacheKey = `${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+
+  // 1. In-memory cache
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    console.log(`Heatmap cache hit: ${cacheKey}`);
     return res.json(cached.data);
   }
 
+  // 2. DB cache — persist across restarts
   try {
-    // Step 1: Get real street geometries from Overpass API
-    const overpassQuery = `[out:json][timeout:20];way(around:500,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street)$"]["name"];out geom;`;
-    
-    // Try multiple Overpass endpoints in case one is down
-    let data = null;
-    for (const endpoint of [
-      "https://overpass.kumi.systems/api/interpreter",
-      "https://overpass-api.de/api/interpreter",
-    ]) {
-      try {
-        const r = await fetch(endpoint, { 
-          method: "POST",
-          headers: { 
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "StreetParkNow/1.0 (streetparknow.vercel.app; contact: support@streetparknow.app)",
-            "Accept": "application/json",
-          },
-          body: `data=${encodeURIComponent(overpassQuery)}`,
-          signal: AbortSignal.timeout(18000)
-        });
-        if (r.ok) { data = await r.json(); break; }
-        console.error(`Overpass ${endpoint} status: ${r.status}`);
-      } catch(e) { console.error(`Overpass ${endpoint} failed:`, e.message); }
+    const { rows } = await db.query("SELECT data FROM heatmap_cache WHERE cache_key=$1 AND updated_at > NOW() - INTERVAL '24 hours'", [cacheKey]);
+    if (rows.length > 0) {
+      const data = rows[0].data;
+      heatmapCache.set(cacheKey, { data, ts: Date.now() });
+      return res.json(data);
     }
-    
+  } catch(e) { console.error("DB cache read error:", e.message); }
+
+  try {
+    const overpassQuery = `[out:json][timeout:20];way(around:500,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street)$"]["name"];out geom;`;
+    const data = await fetchOverpass(overpassQuery);
+
     if (!data) { console.error("All Overpass endpoints failed"); return res.json([]); }
-    
+
     const ways = (data.elements || []).filter(w => w.tags?.name && w.geometry?.length > 1);
     console.log(`Heatmap: ${ways.length} ways found near ${lat},${lng}`);
 
@@ -691,6 +703,14 @@ Return ONLY the JSON object:`, 2000);
       });
 
     heatmapCache.set(cacheKey, { data: result, ts: Date.now() });
+    // Save to DB cache for persistence across restarts
+    try {
+      await db.query(
+        `INSERT INTO heatmap_cache (cache_key, data) VALUES ($1, $2)
+         ON CONFLICT (cache_key) DO UPDATE SET data=$2, updated_at=NOW()`,
+        [cacheKey, JSON.stringify(result)]
+      );
+    } catch(e) { console.error("DB cache write error:", e.message); }
     res.json(result);
   } catch(e) { console.error("Heatmap error:", e.message); res.json([]); }
 });
@@ -1136,6 +1156,11 @@ async function initDB() {
       lng DOUBLE PRECISION,
       loc_data JSONB,
       searched_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS heatmap_cache (
+      cache_key TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
   console.log("✅ DB ready");

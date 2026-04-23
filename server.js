@@ -1143,7 +1143,7 @@ app.post("/subscribe", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ─── STRIPE ───────────────────────────────────────────────────────────────────
+// ─── STRIPE CHECKOUT ───────────────────────────────────────────────────────────────────
 app.post("/create-checkout-session", async (req, res) => {
   const { plan, userId, email } = req.body;
   const PRICES = {

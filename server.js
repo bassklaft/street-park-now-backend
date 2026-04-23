@@ -391,7 +391,10 @@ app.get("/api/geocode", async (req, res) => {
 
           // For everything else — establishments, landmarks, addresses, parks
           // Always return nearby streets so user is never stranded
-          return res.json({ type:"location", isGPS:true, isNeighborhood:false, isZip:false, isPark:false, isEstablishment:false, label, street, borough, neighborhood, city, state, lat, lng, nearbyStreets:streets.length > 0 ? streets : [street].filter(Boolean), originalQuery:q });
+          const nearbyWithPrimary = streets.length > 0
+            ? (street && !streets.includes(street) ? [street, ...streets] : streets)
+            : [street].filter(Boolean);
+          return res.json({ type:"location", isGPS:true, isNeighborhood:false, isZip:false, isPark:false, isEstablishment:false, label, street, borough, neighborhood, city, state, lat, lng, nearbyStreets:nearbyWithPrimary, originalQuery:q });
           } // end usResult
         }
       }
@@ -502,6 +505,10 @@ Return ONLY the JSON array.`, 1000);
 
   // Fallback if Claude fails
   if (nearbyStreets.length === 0) nearbyStreets = [primaryStreet];
+  // Always ensure primary street is included
+  if (primaryStreet && !nearbyStreets.includes(primaryStreet)) {
+    nearbyStreets = [primaryStreet, ...nearbyStreets];
+  }
 
   return res.json({
     street: primaryStreet,

@@ -738,7 +738,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v2:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v3:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);

@@ -717,7 +717,7 @@ app.get("/api/heatmap", async (req, res) => {
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
 
   try {
-    const { rows } = await db.query("SELECT data FROM heatmap_cache WHERE cache_key=$1 AND updated_at > NOW() - INTERVAL '24 hours'", [cacheKey]);
+    const { rows } = await db.query("SELECT data FROM heatmap_cache WHERE cache_key=$1 AND updated_at > NOW() - INTERVAL '6 hours'", [cacheKey]);
     if (rows.length > 0) {
       const data = rows[0].data;
       heatmapCache.set(cacheKey, { data, ts: Date.now() });

@@ -72,14 +72,20 @@ async function askClaude(prompt, maxTokens = 1500) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-5",
+      model: "claude-haiku-4-5-20251001",
       max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
     }),
   });
-  if (!r.ok) throw new Error(`Claude API ${r.status}`);
+  if (!r.ok) {
+    const err = await r.text();
+    console.error(`Claude API ${r.status}:`, err.substring(0, 200));
+    throw new Error(`Claude API ${r.status}`);
+  }
   const d = await r.json();
-  return d.content?.[0]?.text || "";
+  const text = d.content?.[0]?.text || "";
+  if (!text) console.error("Claude returned empty text, full response:", JSON.stringify(d).substring(0, 200));
+  return text;
 }
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────

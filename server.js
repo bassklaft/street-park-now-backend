@@ -1383,6 +1383,23 @@ async function initDB() {
   // Idempotent migration: street was originally NOT NULL. Unlimited-tier
   // subscribers may have no tracked street, so allow NULL.
   await db.query(`ALTER TABLE subscribers ALTER COLUMN street DROP NOT NULL`).catch(() => {});
+
+  // Production subscribers.phone is missing its UNIQUE constraint, which
+  // makes `ON CONFLICT (phone) DO UPDATE` in /subscribe fail with
+  // "there is no unique or exclusion constraint matching the ON CONFLICT
+  // specification". Dedupe any duplicates first (keep the newest row per
+  // phone), then add the constraint. Both steps swallow errors so startup
+  // never wedges — the logs will show why if a future migration matters.
+  await db.query(
+    `DELETE FROM subscribers a USING subscribers b WHERE a.id < b.id AND a.phone = b.phone`
+  ).catch(e => console.error("Subscribers dedupe failed:", e.message));
+  await db.query(
+    `ALTER TABLE subscribers ADD CONSTRAINT subscribers_phone_key UNIQUE (phone)`
+  ).catch(e => {
+    if (!/already exists/i.test(e.message)) {
+      console.error("Add UNIQUE on subscribers.phone failed:", e.message);
+    }
+  });
   console.log("✅ DB ready");
 }
 

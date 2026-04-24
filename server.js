@@ -719,11 +719,16 @@ app.get("/api/geocode", async (req, res) => {
   // Wrigley Field, MetLife, Court Square, West Village, 90210, The MET — all of it
   if (GOOGLE_KEY) {
     try {
-      // Build location bias from user's GPS if available — critical for address disambiguation
+      // Build location bias from user's GPS if available — critical for address
+      // disambiguation ("395 Leonard St" can land in Tribeca, Williamsburg,
+      // Ridgewood, etc. without a bias). 5km is tight enough to disambiguate
+      // between nearby blocks but wide enough to tolerate drift.
       const biasParam = userLat && userLng
-        ? `&location=${userLat},${userLng}&radius=50000`  // 50km radius around user
+        ? `&location=${userLat},${userLng}&radius=5000`
         : "";
-      const gUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(qClean)}&key=${GOOGLE_KEY}&region=us${biasParam}`;
+      // Hard country filter — region=us is only a hint, components=country:US
+      // is the actual constraint and also accepts CA for Canadian addresses.
+      const gUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(qClean)}&key=${GOOGLE_KEY}&region=us&components=country:US|country:CA${biasParam}`;
       const gr = await fetch(gUrl);
       if (gr.ok) {
         const gd = await gr.json();

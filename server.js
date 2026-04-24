@@ -1531,30 +1531,55 @@ app.get("/api/heatmap", async (req, res) => {
 
   const cacheKey = `v23:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
-  const cached = heatmapCache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
+  // Stale-while-revalidate: if we have ANY cached entry (fresh or stale),
+  // serve it immediately so polylines render the moment the map opens.
+  // Fresh data (≤6h) and we're done; stale data triggers a background
+  // refresh so the next request gets current info.
+  const FRESH_MS = 6 * 3600 * 1000;
+  let alreadyResponded = false;
 
-  try {
-    const { rows } = await db.query("SELECT data FROM heatmap_cache WHERE cache_key=$1 AND updated_at > NOW() - INTERVAL '6 hours'", [cacheKey]);
-    if (rows.length > 0) {
-      const data = rows[0].data;
-      heatmapCache.set(cacheKey, { data, ts: Date.now() });
-      return res.json(data);
-    }
-  } catch(e) {}
+  const cached = heatmapCache.get(cacheKey);
+  if (cached) {
+    res.json(cached.data);
+    alreadyResponded = true;
+    if (Date.now() - cached.ts < FRESH_MS) return;
+    // Stale in-memory → fall through and refresh
+  }
+
+  if (!alreadyResponded) {
+    try {
+      const { rows } = await db.query("SELECT data, updated_at FROM heatmap_cache WHERE cache_key=$1", [cacheKey]);
+      if (rows.length > 0) {
+        const data = rows[0].data;
+        const ageMs = Date.now() - new Date(rows[0].updated_at).getTime();
+        heatmapCache.set(cacheKey, { data, ts: Date.now() - ageMs });
+        res.json(data);
+        alreadyResponded = true;
+        if (ageMs < FRESH_MS) return;
+        // Stale DB entry → fall through to refresh (fire-and-forget)
+      }
+    } catch(e) {}
+  }
 
   try {
     const overpassQuery = `[out:json][timeout:25];way(around:1000,${lat},${lng})["highway"~"^(residential|secondary|tertiary|primary|unclassified|living_street)$"]["name"];out geom;`;
     const r = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`, {
       headers: { "User-Agent": "StreetParkNow/1.0 (streetparknow.vercel.app)" }
     });
-    if (!r.ok) { console.error("Overpass status:", r.status); return res.json([]); }
+    if (!r.ok) {
+      console.error("Overpass status:", r.status);
+      if (!alreadyResponded) res.json([]);
+      return;
+    }
     const data = await r.json();
     const ways = (data.elements || []).filter(w => w.tags?.name && w.geometry?.length > 1);
     console.log(`Overpass: ${ways.length} ways`);
 
     const streetNames = [...new Set(ways.map(w => normStreet(w.tags.name)))].slice(0, 80);
-    if (!streetNames.length) return res.json([]);
+    if (!streetNames.length) {
+      if (!alreadyResponded) res.json([]);
+      return;
+    }
 
     // City allowlist: only ask Claude for cleaning schedules where weekly
     // street-sweeping / alt-side regimes genuinely exist. Outside these
@@ -1735,7 +1760,8 @@ app.get("/api/heatmap", async (req, res) => {
         ? `${profile.name} (${profile.isStrict24h ? "strict 24h" : "metered-only"})`
         : "outside city allowlist";
       console.log(`Heatmap ${label}: ${result.length} streets · ${meteredCount} metered-red · ${osmRed} OSM-red · ${osmYellow} OSM-yellow`);
-      return res.json(result);
+      if (!alreadyResponded) res.json(result);
+      return;
     }
 
     // Chicago branch: use real city data (zone polygons + scheduled dates)
@@ -1777,7 +1803,8 @@ app.get("/api/heatmap", async (req, res) => {
         } catch(e) {}
         const nonGray = result.filter(r => r.urgency !== "gray").length;
         console.log(`Chicago heatmap: ${result.length} ways, ${nonGray} classified, ${permitBoosted} permit-boosted`);
-        return res.json(result);
+        if (!alreadyResponded) res.json(result);
+        return;
       }
     }
 
@@ -1959,8 +1986,11 @@ Return ONLY the JSON object:`, 4000);
     } catch(e) {}
 
     console.log(`Heatmap: ${result.length} streets`);
-    res.json(result);
-  } catch(e) { console.error("Heatmap error:", e.message); res.json([]); }
+    if (!alreadyResponded) res.json(result);
+  } catch(e) {
+    console.error("Heatmap error:", e.message);
+    if (!alreadyResponded) res.json([]);
+  }
 });
 
 // Strategy: search by street name fragments, nearby cross streets, and borough-wide

@@ -2076,9 +2076,18 @@ app.get("/api/events", async (req, res) => {
       const events = await chicagoNearbyEvents(+lat, +lng, 0.5);
       for (const ev of events) {
         const id = `chi-park-${ev.venue}-${ev.startDate}-${ev.name}`;
+        // Chicago Park District entries cover charity runs (Soldier Field 10),
+        // festivals, races, AIDS Walk etc — classify by name.
+        const lower = (ev.name || "").toLowerCase();
+        const category = /\b(run|5k|10k|marathon|triathlon|walk)\b/.test(lower) ? "race"
+                       : /\b(festival|fair|celebration)\b/.test(lower) ? "festival"
+                       : /\b(parade|march|procession)\b/.test(lower) ? "parade"
+                       : /\b(protest|demonstrat|rally|vigil)\b/.test(lower) ? "demonstration"
+                       : "other";
         if (!results.has(id)) results.set(id, {
           name: ev.name,
           type: `Chicago Park District @ ${ev.venue}`,
+          category,
           start: ev.startDate,
           end: ev.endDate || ev.startDate,
           location: ev.venue,
@@ -2103,6 +2112,7 @@ app.get("/api/events", async (req, res) => {
         if (!results.has(id)) results.set(id, {
           name: `${ev.away} @ ${ev.home}`,
           type: `${ev.league} @ ${ev.venue}`,
+          category: "sports",
           start: ev.startDate,
           end: ev.startDate,
           location: ev.venue,
@@ -2114,70 +2124,79 @@ app.get("/api/events", async (req, res) => {
     } catch(e) { console.error("Sports events:", e.message); }
   }
 
+  // Classify an event by name + type keywords into the buckets the frontend
+  // card renders with icons. Order matters — earlier matches win.
+  const categorizeEvent = (name, type, closureType) => {
+    const s = `${name || ""} ${type || ""}`.toLowerCase();
+    if (/\b(parade|march|procession)\b/.test(s)) return "parade";
+    if (/\b(protest|demonstrat|rally|vigil)\b/.test(s)) return "demonstration";
+    if (/\b(marathon|\d+k run|\d+k walk|half.?marathon|triathlon|ride|cycling|run\/walk)\b/.test(s) || /\b5k\b/.test(s) || /\b10k\b/.test(s)) return "race";
+    if (/\b(festival|fair|celebration|lunar new year|chinese new year|holiday market|street fair|cultural)\b/.test(s)) return "festival";
+    if (/\b(construction|paving|resurfacing|utility|water main|sewer|gas work|con edison|conedison)\b/.test(s)) return "construction";
+    if (/sport\s*-/.test(s) || /\b(baseball|softball|soccer|basketball|lacrosse|football|tennis)\b/.test(s)) return "youth_sports";
+    if (closureType) return "street_event";
+    return "other";
+  };
+
   if (shouldHitNYCSources) try {
-    // Source 1: NYC Special Events (tvpp-9vvx) — parades, street fairs, etc.
-    const bf = borough ? `%20AND%20upper(borough)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
-    const url1 = `${SOCRATA}/tvpp-9vvx.json?$where=startdate%20>=%20'${today}'%20AND%20startdate%20<=%20'${toDateStr}'${bf}&$limit=30&$order=startdate%20ASC`;
+    // NYC Special Events Permit Information (tvpp-9vvx). Schema uses
+    // event_name / event_type / start_date_time / end_date_time /
+    // event_borough / event_location / street_closure_type — the
+    // old queryable schema this code had (eventname/startdate) was
+    // silently returning nothing.
+    const bf = borough ? `%20AND%20upper(event_borough)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
+    const url1 = `${SOCRATA}/tvpp-9vvx.json?$where=start_date_time%20>=%20'${today}'%20AND%20start_date_time%20<=%20'${toDateStr}'${bf}&$limit=60&$order=start_date_time%20ASC`;
     const r1 = await fetch(url1);
     if (r1.ok) {
       const data = await r1.json();
       data.forEach(ev => {
-        const id = ev.uniquekey || ev.eventid || ev.eventname;
+        const name = ev.event_name || "City Event";
+        const type = ev.event_type || "Event";
+        const closure = ev.street_closure_type;
+        const cat = categorizeEvent(name, type, closure);
+        // Skip park-interior youth sports — they don't affect street parking.
+        if (cat === "youth_sports" && !closure) return;
+        const id = ev.event_id || `${name}-${ev.start_date_time}`;
         if (!results.has(id)) results.set(id, {
-          name: ev.eventname || ev.name || "City Event",
-          type: ev.eventtype || "Event",
-          start: ev.startdate,
-          end: ev.enddate,
-          location: ev.eventlocation || ev.streetname || "",
-          borough: ev.borough || "",
-          parkingImpacted: !!(ev.parkingimpacted || ev.street_closure_type)
+          name,
+          type,
+          category: cat,
+          start: (ev.start_date_time || "").split("T")[0],
+          end: (ev.end_date_time || "").split("T")[0],
+          location: ev.event_location || "",
+          borough: ev.event_borough || "",
+          parkingImpacted: !!closure,
         });
       });
     }
-  } catch(e) { console.error("Events source 1:", e.message); }
+  } catch(e) { console.error("Events tvpp-9vvx:", e.message); }
 
   if (shouldHitNYCSources) try {
-    // Source 2: NYC Street Closures (uiay-nctp)
-    const bf2 = borough ? `%20AND%20upper(borough_name)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
-    const url2 = `${SOCRATA}/uiay-nctp.json?$where=work_start_date%20>=%20'${today}'%20AND%20work_start_date%20<=%20'${toDateStr}'${bf2}&$limit=20&$order=work_start_date%20ASC`;
+    // NYC Construction Street Closures (i6b5-j7bu) — replaces the dead
+    // uiay-nctp dataset. Includes DOT paving, utility work, gas main
+    // repairs, etc., each with on/from/to street names and date ranges.
+    const boroughCode = { "manhattan":"M","brooklyn":"K","queens":"Q","bronx":"X","staten island":"R" }[String(borough || "").toLowerCase()];
+    const bf2 = boroughCode ? `%20AND%20borough_code='${boroughCode}'` : "";
+    const url2 = `${SOCRATA}/i6b5-j7bu.json?$where=work_start_date%20<=%20'${toDateStr}'%20AND%20work_end_date%20>=%20'${today}'${bf2}&$limit=40&$order=work_start_date%20ASC`;
     const r2 = await fetch(url2);
     if (r2.ok) {
       const data = await r2.json();
       data.forEach(ev => {
-        const id = `closure-${ev.objectid || ev.work_order_id}`;
+        const loc = `${ev.onstreetname || ""}${ev.fromstreetname ? ` · ${ev.fromstreetname} to ${ev.tostreetname || ""}` : ""}`.trim();
+        const id = `closure-${ev.segmentid || ev.uniqueid}`;
         if (!results.has(id)) results.set(id, {
-          name: ev.work_order_type || "Street Closure",
-          type: "Street Closure",
-          start: ev.work_start_date?.split("T")[0],
-          end: ev.work_end_date?.split("T")[0],
-          location: `${ev.on_street || ""} ${ev.from_street ? `from ${ev.from_street}` : ""}`.trim(),
-          borough: ev.borough_name || "",
-          parkingImpacted: true
+          name: ev.purpose || "Construction",
+          type: ev.purpose || "Construction",
+          category: "construction",
+          start: (ev.work_start_date || "").split("T")[0],
+          end: (ev.work_end_date || "").split("T")[0],
+          location: loc,
+          borough: borough || "",
+          parkingImpacted: true,
         });
       });
     }
-  } catch(e) { console.error("Events source 2:", e.message); }
-
-  if (shouldHitNYCSources) try {
-    // Source 3: NYC Parade permits (from special events dataset filtered by type)
-    const bf3 = borough ? `%20AND%20upper(borough)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
-    const url3 = `${SOCRATA}/tvpp-9vvx.json?$where=upper(eventtype)%20LIKE%20'%25PARADE%25'%20AND%20startdate%20>=%20'${today}'${bf3}&$limit=10`;
-    const r3 = await fetch(url3);
-    if (r3.ok) {
-      const data = await r3.json();
-      data.forEach(ev => {
-        const id = `parade-${ev.uniquekey || ev.eventname}`;
-        if (!results.has(id)) results.set(id, {
-          name: ev.eventname || "Parade",
-          type: "Parade",
-          start: ev.startdate,
-          location: ev.eventlocation || "",
-          borough: ev.borough || "",
-          parkingImpacted: true
-        });
-      });
-    }
-  } catch(e) {}
+  } catch(e) { console.error("Events i6b5-j7bu:", e.message); }
 
   const all = Array.from(results.values())
     .filter(e => e.start)

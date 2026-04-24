@@ -1033,7 +1033,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v8:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v9:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1169,38 +1169,49 @@ Return ONLY the JSON object:`, 4000);
       let nextClean = null;
 
       if (sch.length) {
-        // First pass: cleaning rules (red = today/tomorrow, yellow = 2-3 days).
+        // Walk every rule once and bucket them:
+        //   - Cleaning + today/tomorrow     -> hardest signal, becomes red
+        //   - Cleaning + in 2-3 days        -> yellow
+        //   - Any non-cleaning rule (metered/permit/rush_hour) active today
+        //                                   -> yellow ("restrictions apply")
+        // A street with ANY cleaning rule at all and none of the above matches
+        // is "green" — we have confirmed data and the next move is >=4 days
+        // away. Only streets with zero usable rules fall through to gray.
+        let cleaningRed = null;       // { time } for today/tomorrow cleaning
+        let cleaningSoon = null;      // { time } for 2-3 day cleaning
+        let restrictionToday = null;  // { kind, time } for metered/rush/permit today
+        let anyCleaning = false;
         for (const s of sch) {
-          if (s.kind && s.kind !== "cleaning") continue;
           const days = s.days || [];
-          if (days.includes(today))    { urgency = "red";    nextClean = `Today ${s.time||""}`.trim(); break; }
-          if (days.includes(tomorrow)) { urgency = "red";    nextClean = `Tomorrow ${s.time||""}`.trim(); break; }
-          if (days.includes(in2days) || days.includes(in3days)) {
-            if (urgency !== "red") { urgency = "yellow"; nextClean = `In 2-3 days ${s.time||""}`.trim(); }
+          const isCleaning = !s.kind || s.kind === "cleaning";
+          if (isCleaning) {
+            anyCleaning = true;
+            if (!cleaningRed && days.includes(today))    cleaningRed  = { when: "Today", time: s.time || "" };
+            else if (!cleaningRed && days.includes(tomorrow)) cleaningRed = { when: "Tomorrow", time: s.time || "" };
+            else if (!cleaningSoon && (days.includes(in2days) || days.includes(in3days))) cleaningSoon = { when: "In 2-3 days", time: s.time || "" };
+          } else if (!restrictionToday && days.includes(today)) {
+            restrictionToday = { kind: s.kind, time: s.time || "" };
           }
         }
-        // Second pass: metered / rush_hour / permit active today. Only elevate
-        // gray -> yellow. Never overrides a red/yellow from a cleaning rule
-        // (cleaning is stronger — you actually have to move the car).
-        if (urgency === "gray") {
-          for (const s of sch) {
-            if (s.kind === "cleaning" || !s.kind) continue;
-            const days = s.days || [];
-            if (days.includes(today)) {
-              urgency = "yellow";
-              const label = s.kind === "metered" ? "Metered"
-                         : s.kind === "rush_hour" ? "Rush-hour no parking"
-                         : s.kind === "permit" ? "Permit only"
-                         : s.kind;
-              nextClean = `${label} today ${s.time||""}`.trim();
-              meteredCount++;
-              break;
-            }
-          }
+        if (cleaningRed) {
+          urgency = "red";
+          nextClean = `${cleaningRed.when} ${cleaningRed.time}`.trim();
+        } else if (cleaningSoon) {
+          urgency = "yellow";
+          nextClean = `${cleaningSoon.when} ${cleaningSoon.time}`.trim();
+        } else if (restrictionToday) {
+          urgency = "yellow";
+          const label = restrictionToday.kind === "metered" ? "Metered"
+                     : restrictionToday.kind === "rush_hour" ? "Rush-hour no parking"
+                     : restrictionToday.kind === "permit" ? "Permit only"
+                     : restrictionToday.kind;
+          nextClean = `${label} today ${restrictionToday.time}`.trim();
+          meteredCount++;
+        } else if (anyCleaning) {
+          urgency = "green";
         }
-        // If the street had schedules but none matched today/near, stay gray
-        // rather than falsely claiming "safe" — a schedule we couldn't bucket
-        // is a signal we might be misinterpreting, not a green light.
+        // Otherwise stays gray — schedule entries that we couldn't bucket
+        // mean we're probably misinterpreting the data; don't call it safe.
       } else {
         const osm = osmParkingStatus(w.tags);
         if (osm) {

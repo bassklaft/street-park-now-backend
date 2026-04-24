@@ -1529,7 +1529,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v22:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v23:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1563,16 +1563,20 @@ app.get("/api/heatmap", async (req, res) => {
     // don't have block-level weekly sweeping; Claude was making it up).
     // Chicago is handled by its own real-data branch earlier in this function.
     const CLEANING_CITY_BBOXES = [
-      { name:"NYC",      minLat:40.49, maxLat:40.92, minLng:-74.26, maxLng:-73.69 },
-      { name:"Boston",   minLat:42.20, maxLat:42.45, minLng:-71.20, maxLng:-70.85 },
-      { name:"DC",       minLat:38.80, maxLat:39.00, minLng:-77.15, maxLng:-76.90 },
-      { name:"Philly",   minLat:39.87, maxLat:40.14, minLng:-75.28, maxLng:-74.96 },
-      { name:"SF",       minLat:37.70, maxLat:37.83, minLng:-122.52,maxLng:-122.35 },
-      { name:"LA",       minLat:33.70, maxLat:34.35, minLng:-118.65,maxLng:-118.15 },
-      { name:"Seattle",  minLat:47.45, maxLat:47.73, minLng:-122.46,maxLng:-122.22 },
-      { name:"Portland", minLat:45.43, maxLat:45.65, minLng:-122.81,maxLng:-122.44 },
-      { name:"Baltimore",minLat:39.20, maxLat:39.38, minLng:-76.72, maxLng:-76.52 },
-      { name:"Toronto",  minLat:43.58, maxLat:43.86, minLng:-79.64, maxLng:-79.11 },
+      { name:"NYC",       minLat:40.49, maxLat:40.92, minLng:-74.26,  maxLng:-73.69 },
+      { name:"Boston",    minLat:42.20, maxLat:42.45, minLng:-71.20,  maxLng:-70.85 },
+      { name:"DC",        minLat:38.80, maxLat:39.00, minLng:-77.15,  maxLng:-76.90 },
+      { name:"Philly",    minLat:39.87, maxLat:40.14, minLng:-75.28,  maxLng:-74.96 },
+      { name:"SF",        minLat:37.70, maxLat:37.83, minLng:-122.52, maxLng:-122.35 },
+      { name:"LA",        minLat:33.70, maxLat:34.35, minLng:-118.65, maxLng:-118.15 },
+      { name:"Seattle",   minLat:47.45, maxLat:47.73, minLng:-122.46, maxLng:-122.22 },
+      { name:"Portland",  minLat:45.43, maxLat:45.65, minLng:-122.81, maxLng:-122.44 },
+      { name:"Baltimore", minLat:39.20, maxLat:39.38, minLng:-76.72,  maxLng:-76.52 },
+      { name:"Toronto",   minLat:43.58, maxLat:43.86, minLng:-79.64,  maxLng:-79.11 },
+      { name:"Sacramento",minLat:38.43, maxLat:38.68, minLng:-121.60, maxLng:-121.35 },
+      { name:"San Diego", minLat:32.53, maxLat:33.12, minLng:-117.36, maxLng:-116.90 },
+      { name:"Oakland",   minLat:37.70, maxLat:37.86, minLng:-122.35, maxLng:-122.10 },
+      { name:"Minneapolis",minLat:44.89,maxLat:45.06, minLng:-93.33,  maxLng:-93.19 },
     ];
     const cleaningCity = CLEANING_CITY_BBOXES.find(b =>
       +lat >= b.minLat && +lat <= b.maxLat && +lng >= b.minLng && +lng <= b.maxLng

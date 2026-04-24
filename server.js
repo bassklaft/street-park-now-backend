@@ -1504,7 +1504,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v15:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v16:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1553,13 +1553,52 @@ app.get("/api/heatmap", async (req, res) => {
       +lat >= b.minLat && +lat <= b.maxLat && +lng >= b.minLng && +lng <= b.maxLng
     );
     if (!cleaningCity) {
-      // Default all streets to green — honest "no known scheduled rule."
-      const result = ways.map(w => ({
-        street: normStreet(w.tags.name),
-        coords: w.geometry.map(p => [p.lat, p.lon]),
-        urgency: "green",
-        nextClean: null,
-      }));
+      // "Strict 24-hour" cities: municipal ordinance caps overnight parking on
+      // any city street. Default to yellow (not green) so we don't falsely
+      // imply "safe for 4+ days." Dallas SEC 28-84 explicitly prohibits
+      // parking > 24 consecutive hours citywide; verified at
+      // codelibrary.amlegal.com/codes/dallas/latest/dallas_tx/0-0-0-112892.
+      const STRICT_24H_CITIES = [
+        { name:"Dallas", bbox:{ minLat:32.61, maxLat:32.99, minLng:-96.99, maxLng:-96.57 },
+          ordinance:"SEC 28-84",
+          note:"Dallas 24-hour street parking limit · move within a day or risk tow",
+          // Downtown arterials with posted meter enforcement per dallascityhall.com
+          // and parkmobile.io references. Names are in our normStreet() form.
+          meteredStreets: new Set([
+            "MAIN STREET", "ELM STREET", "COMMERCE STREET",
+            "AKARD STREET", "ERVAY STREET", "FIELD STREET",
+            "HARWOOD STREET", "GRIFFIN STREET", "LAMAR STREET",
+            "PEARL STREET", "ROSS AVENUE", "SAINT PAUL STREET",
+            "BRYAN STREET", "JACKSON STREET", "WOOD STREET",
+          ]),
+          meteredBbox:{ minLat:32.77, maxLat:32.79, minLng:-96.81, maxLng:-96.79 },
+          meteredText:"Metered · Mon-Sat business hours (check meter)",
+        },
+      ];
+      const strict = STRICT_24H_CITIES.find(c =>
+        +lat >= c.bbox.minLat && +lat <= c.bbox.maxLat &&
+        +lng >= c.bbox.minLng && +lng <= c.bbox.maxLng
+      );
+      let meteredCount = 0;
+      const result = ways.map(w => {
+        const name = normStreet(w.tags.name);
+        const coords = w.geometry.map(p => [p.lat, p.lon]);
+        if (!strict) {
+          // No ordinance data — honest green default.
+          return { street: name, coords, urgency: "green", nextClean: null };
+        }
+        // Strict 24h city: default yellow (citywide rule). Elevate to red
+        // if this segment is in the downtown metered bbox AND the name
+        // matches the posted-meter list from the city's parking pages.
+        const mid = w.geometry[Math.floor(w.geometry.length / 2)];
+        const inMeteredBox = mid.lat >= strict.meteredBbox.minLat && mid.lat <= strict.meteredBbox.maxLat &&
+                             mid.lon >= strict.meteredBbox.minLng && mid.lon <= strict.meteredBbox.maxLng;
+        if (inMeteredBox && strict.meteredStreets.has(name)) {
+          meteredCount++;
+          return { street: name, coords, urgency: "red", nextClean: strict.meteredText };
+        }
+        return { street: name, coords, urgency: "yellow", nextClean: strict.note };
+      });
       heatmapCache.set(cacheKey, { data: result, ts: Date.now() });
       try {
         await db.query(
@@ -1567,7 +1606,8 @@ app.get("/api/heatmap", async (req, res) => {
           [cacheKey, JSON.stringify(result)]
         );
       } catch(e) {}
-      console.log(`Heatmap (outside cleaning-city allowlist): ${result.length} streets → all green`);
+      const label = strict ? `${strict.name} (strict 24h ordinance ${strict.ordinance})` : "outside cleaning-city allowlist";
+      console.log(`Heatmap ${label}: ${result.length} streets · ${meteredCount} metered-red`);
       return res.json(result);
     }
 

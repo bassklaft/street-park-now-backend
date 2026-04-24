@@ -247,6 +247,108 @@ function chicagoNextCleanLabel(nextDate, today) {
   return `${human} (in ${daysAway} days) 9 AM - 2 PM`;
 }
 
+// ─── CHICAGO PERMIT ZONES (dataset u9xt-hiju) ────────────────────────────────
+// Per-block permit-only zones with address ranges. Fetched on demand per
+// street-name batch so we don't pay to cache every zone in the city up-front.
+async function chicagoPermitZones(streetsNormalized) {
+  if (!streetsNormalized?.length) return {};
+  // u9xt-hiju stores direction + name + type separately. Users search with
+  // composed names like "SOUTH MICHIGAN AVENUE" — strip the direction and
+  // street-type suffix to match the dataset's street_name column.
+  const DIR = { NORTH:"N", SOUTH:"S", EAST:"E", WEST:"W" };
+  const SUF = new Set(["AVENUE","AVE","STREET","ST","BOULEVARD","BLVD","ROAD","RD","DRIVE","DR","PLACE","PL","COURT","CT","LANE","LN","PARKWAY","PKWY","TERRACE","TER"]);
+  const decompose = (full) => {
+    const parts = full.toUpperCase().split(/\s+/);
+    let dir = null;
+    if (parts.length && DIR[parts[0]]) { dir = DIR[parts.shift()]; }
+    while (parts.length && SUF.has(parts[parts.length-1])) parts.pop();
+    return { dir, core: parts.join(" ") };
+  };
+  const coreNames = [...new Set(streetsNormalized.map(s => decompose(s).core).filter(Boolean))];
+  if (!coreNames.length) return {};
+  const predicate = coreNames.map(n => `street_name='${n.replace(/'/g,"''")}'`).join(" OR ");
+  const url = `https://data.cityofchicago.org/resource/u9xt-hiju.json?$where=status%3D'ACTIVE'%20AND%20(${encodeURIComponent(predicate)})&$limit=2000`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return {};
+    const rows = await r.json();
+    const byStreet = {};
+    for (const row of rows) {
+      const core = String(row.street_name || "").toUpperCase();
+      const dir = String(row.street_direction || "").toUpperCase();
+      // Match back to the caller's normalized name — prefer exact dir match, fall back to any.
+      const match = streetsNormalized.find(s => {
+        const d = decompose(s);
+        return d.core === core && (!d.dir || !dir || d.dir === dir);
+      });
+      if (!match) continue;
+      if (!byStreet[match]) byStreet[match] = [];
+      byStreet[match].push({
+        zone: row.zone,
+        side: row.odd_even === "O" ? "Odd" : row.odd_even === "E" ? "Even" : "",
+        lowAddr: row.address_range_low,
+        highAddr: row.address_range_high,
+      });
+    }
+    return byStreet;
+  } catch (e) {
+    console.error("Chicago permit zones fetch failed:", e.message);
+    return {};
+  }
+}
+
+// ─── CHICAGO PARK DISTRICT EVENTS (dataset pk66-w54g) ────────────────────────
+// Returns upcoming events at known park facilities near the given coords.
+// Currently whitelists the high-traffic venues whose event permits appear in
+// the dataset (Soldier Field, Grant Park, Millennium Park, Maggie Daley).
+// Expand the list as new venues become relevant.
+const CHICAGO_PARK_VENUES = [
+  { match: /SOLDIER FIELD/i,  name: "Soldier Field",    lat: 41.8624, lng: -87.6167 },
+  { match: /GRANT PARK/i,     name: "Grant Park",       lat: 41.8756, lng: -87.6244 },
+  { match: /MILLENNIUM PARK/i,name: "Millennium Park",  lat: 41.8826, lng: -87.6226 },
+  { match: /MAGGIE DALEY/i,   name: "Maggie Daley Park",lat: 41.8847, lng: -87.6195 },
+];
+
+async function chicagoNearbyEvents(lat, lng, radiusMi = 0.5) {
+  const lt = +lat, ln = +lng;
+  if (!isChicago(lt, ln)) return [];
+  const RADIUS_KM = radiusMi * 1.60934;
+  const nearbyVenues = CHICAGO_PARK_VENUES.filter(v => haversineKm(lt, ln, v.lat, v.lng) <= RADIUS_KM);
+  if (!nearbyVenues.length) return [];
+  const today = new Date().toISOString().slice(0,10);
+  const horizon = new Date(Date.now() + 60 * 86400000).toISOString().slice(0,10);
+  const results = [];
+  for (const venue of nearbyVenues) {
+    const escaped = venue.name.replace(/'/g,"''").toUpperCase();
+    const where = `upper(park_facility_name) LIKE '%${escaped}%' AND reservation_start_date >= '${today}' AND reservation_start_date <= '${horizon}' AND permit_status != 'Canceled'`;
+    const url = `https://data.cityofchicago.org/resource/pk66-w54g.json?$where=${encodeURIComponent(where)}&$order=reservation_start_date&$limit=20`;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      const rows = await r.json();
+      for (const row of rows) {
+        const startStr = row.reservation_start_date || "";
+        const start = new Date(startStr);
+        const days = Math.max(0, Math.floor((start - new Date()) / 86400000));
+        results.push({
+          source: "chicago_park_district",
+          venue: venue.name,
+          venueLat: venue.lat,
+          venueLng: venue.lng,
+          distanceKm: haversineKm(lt, ln, venue.lat, venue.lng).toFixed(2),
+          name: row.event_description || row.event_type || "Park District event",
+          startDate: startStr.slice(0,10),
+          endDate: (row.reservation_end_date || "").slice(0,10),
+          daysAway: days,
+          eventType: row.event_type,
+        });
+      }
+    } catch (e) { console.error(`Park events fetch (${venue.name}):`, e.message); }
+  }
+  results.sort((a,b) => new Date(a.startDate) - new Date(b.startDate));
+  return results;
+}
+
 function parseSignText(text) {
   if (!text) return null;
   const upper = text.toUpperCase();
@@ -936,12 +1038,38 @@ app.get("/api/restrictions", async (req, res) => {
   if (!streetsParam) return res.json({});
   const streets = streetsParam.split(",").map(s => s.trim()).filter(Boolean).slice(0, 30);
   if (!streets.length) return res.json({});
-
-  // NYC-only. Outside NYC we don't have comparable structured data — return
-  // empty so the frontend gracefully hides the card rather than showing
-  // nothing or fabricating entries from sparse OSM tags.
   if (!borough) return res.json({});
   const bor = String(borough).toLowerCase();
+
+  // Chicago branch: real city permit-zone data from u9xt-hiju. Each row is
+  // keyed by street name + address range + zone number. We surface them as
+  // permit_only entries so the frontend card renders them the same way it
+  // renders NYC DOT sign data.
+  if (bor.includes("chicago") || bor.includes("cook county")) {
+    try {
+      const byStreet = await chicagoPermitZones(streets);
+      const TYPE_RANK = { permit_only: 7 };
+      const result = {};
+      for (const s of streets) result[s] = [];
+      for (const [street, entries] of Object.entries(byStreet)) {
+        for (const e of entries) {
+          result[street].push({
+            type: "permit_only",
+            side: e.side,
+            block: e.lowAddr && e.highAddr ? `${e.lowAddr}–${e.highAddr}` : "",
+            description: `Permit Zone ${e.zone} — residents/permitted vehicles only`,
+          });
+        }
+        result[street].sort((a,b) => (TYPE_RANK[a.type] ?? 99) - (TYPE_RANK[b.type] ?? 99));
+      }
+      return res.json(result);
+    } catch (e) {
+      console.error("Chicago restrictions error:", e.message);
+      return res.json({});
+    }
+  }
+
+  // NYC branch: query the DOT Parking Regulation Signs dataset.
   const nycBoroughs = ["brooklyn","manhattan","queens","bronx","staten island"];
   if (!nycBoroughs.some(b => bor.includes(b))) return res.json({});
 
@@ -1033,7 +1161,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v10:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v11:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1063,23 +1191,32 @@ app.get("/api/heatmap", async (req, res) => {
     // Chicago branch: use real city data (zone polygons + scheduled dates)
     // instead of asking Claude. Every residential way that falls inside a
     // ward-section zone gets classified by its next scheduled sweep date.
+    // Permit-zone streets get bumped to yellow when the sweeping signal
+    // would otherwise say green/gray, so a resident searching a permit
+    // block sees "restricted" rather than "safe."
     if (isChicago(+lat, +lng)) {
       const zones = await loadChicagoZones();
       if (zones.length) {
         const today = new Date(); today.setHours(0,0,0,0);
+        // Pull permit zones keyed by normalized street name in one batch.
+        const permitByStreet = await chicagoPermitZones([...new Set(ways.map(w => normStreet(w.tags.name)))]);
+        let permitBoosted = 0;
         const result = ways.map(w => {
           const mid = w.geometry[Math.floor(w.geometry.length / 2)];
           const zone = findChicagoZone(mid.lat, mid.lon, zones);
           const coords = w.geometry.map(p => [p.lat, p.lon]);
           const name = normStreet(w.tags.name);
-          if (!zone) return { street: name, coords, urgency: "gray", nextClean: null };
-          const nextDate = zone.dates.find(d => d >= today);
-          return {
-            street: name,
-            coords,
-            urgency: chicagoUrgency(nextDate, today),
-            nextClean: chicagoNextCleanLabel(nextDate, today),
-          };
+          const nextDate = zone ? zone.dates.find(d => d >= today) : null;
+          let urgency = zone ? chicagoUrgency(nextDate, today) : "gray";
+          let nextClean = zone ? chicagoNextCleanLabel(nextDate, today) : null;
+          // Permit-zone elevation: only upgrade gray/green, never overrides red/yellow cleaning.
+          if ((urgency === "gray" || urgency === "green") && permitByStreet[name]?.length) {
+            const zoneNum = permitByStreet[name][0].zone;
+            urgency = "yellow";
+            nextClean = `Permit Zone ${zoneNum} — residents only`;
+            permitBoosted++;
+          }
+          return { street: name, coords, urgency, nextClean };
         });
         heatmapCache.set(cacheKey, { data: result, ts: Date.now() });
         try {
@@ -1089,7 +1226,7 @@ app.get("/api/heatmap", async (req, res) => {
           );
         } catch(e) {}
         const nonGray = result.filter(r => r.urgency !== "gray").length;
-        console.log(`Chicago heatmap: ${result.length} ways, ${nonGray} classified via real data`);
+        console.log(`Chicago heatmap: ${result.length} ways, ${nonGray} classified, ${permitBoosted} permit-boosted`);
         return res.json(result);
       }
     }
@@ -1336,12 +1473,36 @@ app.get("/api/films", async (req, res) => {
 
 // ─── PUBLIC EVENTS ────────────────────────────────────────────────────────────
 app.get("/api/events", async (req, res) => {
-  const { borough } = req.query;
+  const { borough, lat, lng } = req.query;
   const today = new Date().toISOString().split("T")[0];
   const toDate = new Date(); toDate.setDate(toDate.getDate()+14);
   const toDateStr = toDate.toISOString().split("T")[0];
 
   const results = new Map();
+
+  // Chicago Park District: pulls events at Soldier Field / Grant Park /
+  // Millennium Park / Maggie Daley when the user's coords are within ~0.5 mi.
+  // Surfaces these as event entries with the venue name and parking-impact
+  // flag so the frontend can highlight "Parking restricted during X."
+  if (lat && lng && isChicago(+lat, +lng)) {
+    try {
+      const events = await chicagoNearbyEvents(+lat, +lng, 0.5);
+      for (const ev of events) {
+        const id = `chi-park-${ev.venue}-${ev.startDate}-${ev.name}`;
+        if (!results.has(id)) results.set(id, {
+          name: ev.name,
+          type: `Chicago Park District @ ${ev.venue}`,
+          start: ev.startDate,
+          end: ev.endDate || ev.startDate,
+          location: ev.venue,
+          borough: "Chicago",
+          distance: `${ev.distanceKm} km`,
+          daysAway: ev.daysAway,
+          parkingImpacted: true,
+        });
+      }
+    } catch(e) { console.error("Chicago events:", e.message); }
+  }
 
   try {
     // Source 1: NYC Special Events (tvpp-9vvx) — parades, street fairs, etc.

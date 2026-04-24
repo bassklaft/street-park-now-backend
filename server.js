@@ -1517,7 +1517,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v17:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v18:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1566,12 +1566,11 @@ app.get("/api/heatmap", async (req, res) => {
       +lat >= b.minLat && +lat <= b.maxLat && +lng >= b.minLng && +lng <= b.maxLng
     );
     if (!cleaningCity) {
-      // "Strict 24-hour" cities: municipal ordinance caps overnight parking
-      // on any city street. Default to yellow (not green) so we don't
-      // falsely imply "safe for 4+ days." Each entry cites the actual
-      // ordinance + has a downtown-metered allowlist pulled from the city
-      // parking authority's published street list.
-      const STRICT_24H_CITIES = [
+      // City profiles: each has one or both of (a) a citywide 24h ordinance
+      // driving a yellow default, and (b) a downtown metered street list
+      // elevated to red inside a downtown bbox. Profiles without isStrict24h
+      // keep the normal green default outside the downtown bbox.
+      const CITY_PROFILES = [
         // Dallas SEC 28-84 — https://codelibrary.amlegal.com/codes/dallas/latest/dallas_tx/0-0-0-112892
         { name:"Dallas", bbox:{ minLat:32.61, maxLat:32.99, minLng:-96.99, maxLng:-96.57 },
           ordinance:"SEC 28-84",
@@ -1605,7 +1604,8 @@ app.get("/api/heatmap", async (req, res) => {
         },
         // Houston Ordinance 26-93 — "vehicle cannot legally park on public
         // street for more than 24 hours" (houstontx.gov/parking).
-        { name:"Houston", bbox:{ minLat:29.52, maxLat:30.11, minLng:-95.78, maxLng:-95.02 },
+        { name:"Houston", isStrict24h:true,
+          bbox:{ minLat:29.52, maxLat:30.11, minLng:-95.78, maxLng:-95.02 },
           ordinance:"Ordinance 26-93",
           note:"Houston 24-hour street parking limit · move every day or risk tow",
           meteredStreets: new Set([
@@ -1618,8 +1618,49 @@ app.get("/api/heatmap", async (req, res) => {
           meteredBbox:{ minLat:29.74, maxLat:29.77, minLng:-95.38, maxLng:-95.35 },
           meteredText:"Metered · Mon-Sat business hours (check meter)",
         },
+        // Austin — no verified strict 24h rule; downtown metered only.
+        // City streets outside downtown bbox stay green.
+        { name:"Austin", isStrict24h:false,
+          bbox:{ minLat:30.12, maxLat:30.52, minLng:-97.93, maxLng:-97.56 },
+          meteredStreets: new Set([
+            "CONGRESS AVENUE", "2ND STREET", "3RD STREET", "4TH STREET",
+            "5TH STREET", "6TH STREET", "7TH STREET", "8TH STREET",
+            "BRAZOS STREET", "COLORADO STREET", "LAVACA STREET",
+            "GUADALUPE STREET", "NUECES STREET", "SAN ANTONIO STREET",
+            "WEST AVENUE", "RIO GRANDE STREET",
+          ]),
+          meteredBbox:{ minLat:30.26, maxLat:30.28, minLng:-97.75, maxLng:-97.72 },
+          meteredText:"Metered · Mon-Wed 8-6, Thu-Sat late-night (check meter)",
+        },
+        // Atlanta — downtown metered. No verified citywide 24h rule.
+        { name:"Atlanta", isStrict24h:false,
+          bbox:{ minLat:33.65, maxLat:33.89, minLng:-84.55, maxLng:-84.29 },
+          meteredStreets: new Set([
+            "PEACHTREE STREET", "PEACHTREE STREET NORTHEAST", "PEACHTREE STREET NORTHWEST",
+            "WEST PEACHTREE STREET", "BROAD STREET", "LUCKIE STREET",
+            "MARIETTA STREET", "SPRING STREET", "FORSYTH STREET",
+            "CENTENNIAL OLYMPIC PARK DRIVE", "EDGEWOOD AVENUE", "AUBURN AVENUE",
+            "IVAN ALLEN JR BOULEVARD", "JOHN WESLEY DOBBS AVENUE",
+          ]),
+          meteredBbox:{ minLat:33.75, maxLat:33.78, minLng:-84.40, maxLng:-84.38 },
+          meteredText:"Metered · Mon-Fri business hours (check meter)",
+        },
+        // Denver — downtown metered. No verified citywide 24h rule.
+        { name:"Denver", isStrict24h:false,
+          bbox:{ minLat:39.62, maxLat:39.85, minLng:-105.11, maxLng:-104.83 },
+          meteredStreets: new Set([
+            "16TH STREET", "17TH STREET", "18TH STREET", "19TH STREET",
+            "20TH STREET", "14TH STREET", "15TH STREET", "COLFAX AVENUE",
+            "BROADWAY", "CALIFORNIA STREET", "CHAMPA STREET", "WELTON STREET",
+            "GLENARM PLACE", "TREMONT PLACE", "COURT PLACE", "CURTIS STREET",
+            "ARAPAHOE STREET", "LAWRENCE STREET", "LARIMER STREET", "MARKET STREET",
+            "BLAKE STREET", "WAZEE STREET", "WYNKOOP STREET",
+          ]),
+          meteredBbox:{ minLat:39.74, maxLat:39.76, minLng:-105.00, maxLng:-104.98 },
+          meteredText:"Metered · Mon-Sat business hours (check meter)",
+        },
       ];
-      const strict = STRICT_24H_CITIES.find(c =>
+      const profile = CITY_PROFILES.find(c =>
         +lat >= c.bbox.minLat && +lat <= c.bbox.maxLat &&
         +lng >= c.bbox.minLng && +lng <= c.bbox.maxLng
       );
@@ -1627,21 +1668,24 @@ app.get("/api/heatmap", async (req, res) => {
       const result = ways.map(w => {
         const name = normStreet(w.tags.name);
         const coords = w.geometry.map(p => [p.lat, p.lon]);
-        if (!strict) {
-          // No ordinance data — honest green default.
+        if (!profile) {
           return { street: name, coords, urgency: "green", nextClean: null };
         }
-        // Strict 24h city: default yellow (citywide rule). Elevate to red
-        // if this segment is in the downtown metered bbox AND the name
-        // matches the posted-meter list from the city's parking pages.
+        // Downtown metered check is the same for both strict-24h and
+        // metered-only cities. Red iff in downtown bbox + name on allowlist.
         const mid = w.geometry[Math.floor(w.geometry.length / 2)];
-        const inMeteredBox = mid.lat >= strict.meteredBbox.minLat && mid.lat <= strict.meteredBbox.maxLat &&
-                             mid.lon >= strict.meteredBbox.minLng && mid.lon <= strict.meteredBbox.maxLng;
-        if (inMeteredBox && strict.meteredStreets.has(name)) {
+        const inMeteredBox = mid.lat >= profile.meteredBbox.minLat && mid.lat <= profile.meteredBbox.maxLat &&
+                             mid.lon >= profile.meteredBbox.minLng && mid.lon <= profile.meteredBbox.maxLng;
+        if (inMeteredBox && profile.meteredStreets.has(name)) {
           meteredCount++;
-          return { street: name, coords, urgency: "red", nextClean: strict.meteredText };
+          return { street: name, coords, urgency: "red", nextClean: profile.meteredText };
         }
-        return { street: name, coords, urgency: "yellow", nextClean: strict.note };
+        // Default: yellow for strict-24h cities (citywide ordinance),
+        // green for metered-only cities (no citywide restriction).
+        if (profile.isStrict24h) {
+          return { street: name, coords, urgency: "yellow", nextClean: profile.note };
+        }
+        return { street: name, coords, urgency: "green", nextClean: null };
       });
       heatmapCache.set(cacheKey, { data: result, ts: Date.now() });
       try {
@@ -1650,7 +1694,9 @@ app.get("/api/heatmap", async (req, res) => {
           [cacheKey, JSON.stringify(result)]
         );
       } catch(e) {}
-      const label = strict ? `${strict.name} (strict 24h ordinance ${strict.ordinance})` : "outside cleaning-city allowlist";
+      const label = profile
+        ? `${profile.name} (${profile.isStrict24h ? "strict 24h" : "metered-only"})`
+        : "outside city allowlist";
       console.log(`Heatmap ${label}: ${result.length} streets · ${meteredCount} metered-red`);
       return res.json(result);
     }

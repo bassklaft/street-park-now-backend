@@ -1000,12 +1000,40 @@ app.get("/api/restrictions", async (req, res) => {
   }
 });
 
+// Inspect an Overpass way's tags for parking-restriction signals. Returns
+// {urgency, source} when a restriction is present, or null when none found.
+// Handles both the old parking:lane:* schema and the newer parking:left /
+// parking:right / parking:both schema, plus common truck/standing variants.
+function osmParkingStatus(tags) {
+  if (!tags) return null;
+  const RESTRICTION_VALUES = new Set(["no_parking", "no_stopping", "no_standing", "fire_lane"]);
+  const keys = Object.keys(tags);
+  // Pass 1: absolute-restriction values on any parking-ish key.
+  for (const k of keys) {
+    if (!/^(parking[:_]|no_parking$)/.test(k)) continue;
+    const v = String(tags[k] ?? "").toLowerCase();
+    if (RESTRICTION_VALUES.has(v) || (k === "no_parking" && (v === "yes" || v === "true"))) {
+      return { urgency: "red", source: `${k}=${v}` };
+    }
+  }
+  // Pass 2: time-limited parking via maxstay.
+  for (const k of keys) {
+    if (!k.toLowerCase().includes("maxstay")) continue;
+    return { urgency: "yellow", source: `${k}=${tags[k]}` };
+  }
+  // Pass 3: named restriction relations / access limits surfaced on ways.
+  if (tags["restriction"] && /no_parking|no_stopping/i.test(tags["restriction"])) {
+    return { urgency: "red", source: `restriction=${tags["restriction"]}` };
+  }
+  return null;
+}
+
 // ─── PARKING HEAT MAP — OpenStreetMap via Overpass ───────────────────────────
 app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v6:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v7:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1116,31 +1144,49 @@ Return ONLY the JSON object:`, 3000);
     const in2days  = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+172800000).getDay()];
     const in3days  = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.now()+259200000).getDay()];
 
-    // Outside NYC we have no canonical fallback source for street cleaning
-    // (Claude is our only signal). Default an unclassified street to green
-    // — "we checked and no weekly rule applies" — instead of gray, which
-    // reads to users as "we don't know." NYC keeps gray because we expect
-    // comprehensive coverage there and a missing street means we failed.
+    // Classification is honest about what we actually know:
+    //   1. Claude returned a weekly schedule → red/yellow/green by day.
+    //   2. No schedule, but OSM tags say no-parking / time-limit → red / yellow.
+    //   3. No schedule, no OSM restriction, outside NYC → green ("actively
+    //      checked two sources, nothing applies today"). Inside NYC we keep
+    //      gray because we expect comprehensive coverage and a missing entry
+    //      means we failed, not that the street is rule-free.
     const NYC_BBOX = { minLat: 40.49, maxLat: 40.92, minLng: -74.26, maxLng: -73.69 };
     const inNYC = +lat >= NYC_BBOX.minLat && +lat <= NYC_BBOX.maxLat && +lng >= NYC_BBOX.minLng && +lng <= NYC_BBOX.maxLng;
-    const noDataDefault = inNYC ? "gray" : "green";
 
+    let osmRedCount = 0, osmYellowCount = 0;
     const result = ways.map(w => {
       const name = normStreet(w.tags.name);
       const sch = schedulesByKey[name] || [];
       const coords = w.geometry.map(p => [p.lat, p.lon]);
-      let urgency = sch.length ? "green" : noDataDefault;
+      let urgency;
       let nextClean = null;
-      for (const s of sch) {
-        const days = s.days || [];
-        if (days.includes(today))    { urgency = "red";    nextClean = `Today ${s.time||""}`.trim(); break; }
-        if (days.includes(tomorrow)) { urgency = "red";    nextClean = `Tomorrow ${s.time||""}`.trim(); break; }
-        if (days.includes(in2days)||days.includes(in3days)) {
-          if (urgency !== "red") { urgency = "yellow"; nextClean = `In 2-3 days ${s.time||""}`.trim(); }
+
+      if (sch.length) {
+        urgency = "green";
+        for (const s of sch) {
+          const days = s.days || [];
+          if (days.includes(today))    { urgency = "red";    nextClean = `Today ${s.time||""}`.trim(); break; }
+          if (days.includes(tomorrow)) { urgency = "red";    nextClean = `Tomorrow ${s.time||""}`.trim(); break; }
+          if (days.includes(in2days)||days.includes(in3days)) {
+            if (urgency !== "red") { urgency = "yellow"; nextClean = `In 2-3 days ${s.time||""}`.trim(); }
+          }
+        }
+      } else {
+        const osm = osmParkingStatus(w.tags);
+        if (osm) {
+          urgency = osm.urgency;
+          nextClean = `OSM tag: ${osm.source}`;
+          if (osm.urgency === "red") osmRedCount++; else if (osm.urgency === "yellow") osmYellowCount++;
+        } else {
+          urgency = inNYC ? "gray" : "green";
         }
       }
       return { street: name, coords, urgency, nextClean };
     });
+    if (osmRedCount + osmYellowCount > 0) {
+      console.log(`OSM tag classification: red=${osmRedCount} yellow=${osmYellowCount}`);
+    }
 
     heatmapCache.set(cacheKey, { data: result, ts: Date.now() });
     try {

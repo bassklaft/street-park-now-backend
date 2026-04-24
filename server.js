@@ -1776,12 +1776,280 @@ function osmParkingStatus(tags) {
   return null;
 }
 
+// ─── DENVER PARKING RESTRICTIONS (real ArcGIS data) ──────────────────────────
+// Denver DOTI publishes ODC_TRANS_PARKINGRESTRICTIONS_L — line segments
+// with full restriction text + AM/MD/PM slice codes. Verified live against
+// services1.arcgis.com/zdB7qR0BtYrg0Xpl. ~50k segments citywide.
+const DENVER_BBOX = { minLat:39.55, maxLat:39.88, minLng:-105.20, maxLng:-104.50 };
+const DENVER_RESTRICTIONS_URL =
+  "https://services1.arcgis.com/zdB7qR0BtYrg0Xpl/arcgis/rest/services/ODC_TRANS_PARKINGRESTRICTIONS_L/FeatureServer/360/query";
+function isDenver(lat, lng) {
+  return lat >= DENVER_BBOX.minLat && lat <= DENVER_BBOX.maxLat &&
+         lng >= DENVER_BBOX.minLng && lng <= DENVER_BBOX.maxLng;
+}
+async function denverRestrictionsNear(lat, lng, radiusKm = 1.5) {
+  const degLat = radiusKm / 111;
+  const degLng = radiusKm / (111 * Math.cos(lat * Math.PI / 180));
+  const envelope = {
+    xmin: lng - degLng, ymin: lat - degLat,
+    xmax: lng + degLng, ymax: lat + degLat,
+    spatialReference: { wkid: 4326 },
+  };
+  const params = new URLSearchParams({
+    geometry: JSON.stringify(envelope),
+    geometryType: "esriGeometryEnvelope",
+    spatialRel: "esriSpatialRelIntersects",
+    inSR: "4326",
+    outFields: "FULLNAME,SIDE,RESTRICTION_FULL,RESTRICTION_AM,RESTRICTION_MD,RESTRICTION_PM,RPP",
+    outSR: "4326",
+    returnGeometry: "false",
+    f: "json",
+    resultRecordCount: "2000",
+  });
+  try {
+    const r = await fetch(`${DENVER_RESTRICTIONS_URL}?${params}`);
+    if (!r.ok) { console.error("Denver ArcGIS:", r.status); return []; }
+    const data = await r.json();
+    return data.features || [];
+  } catch (e) { console.error("Denver restrictions fetch:", e.message); return []; }
+}
+// Map Denver restrictions to our urgency buckets. The AM/MD/PM codes are
+// per time slice (5am / 12pm / 7pm); we pick the slice matching the user's
+// current local hour and classify red (no parking), yellow (any other
+// restriction), or null (OK). Permit zones (RPP="Y") elevate to yellow.
+function denverUrgencyFor(attr, now = new Date()) {
+  const full = String(attr.RESTRICTION_FULL || "").trim();
+  if (!full) return null;
+  const fullLc = full.toLowerCase();
+  // Always-active RED cases
+  if (/no parking any time|tow away|fire\s*lane/.test(fullLc)) {
+    return { urgency: "red", note: full };
+  }
+  // Time-sliced: pick the current bucket in America/Denver tz.
+  const hr = +new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Denver", hour: "numeric", hour12: false,
+  }).formatToParts(now).find(p => p.type === "hour").value;
+  const code = hr < 10 ? (attr.RESTRICTION_AM || "")
+              : hr < 16 ? (attr.RESTRICTION_MD || "")
+              : (attr.RESTRICTION_PM || "");
+  const c = String(code).trim().toUpperCase();
+  if (!c || c === "OK") {
+    // Residential permit zones still count as a yellow flag — a visitor
+    // without a permit can't park even if the slice code is empty.
+    if (String(attr.RPP || "").trim().toUpperCase() === "Y") {
+      return { urgency: "yellow", note: `${full} · Permit Zone` };
+    }
+    return null;
+  }
+  if (c === "NP") return { urgency: "red", note: full };
+  // 2H / 4H / LZ / MET / VPK / SCH / TAX / LOC → yellow
+  return { urgency: "yellow", note: full };
+}
+
+// ─── MINNEAPOLIS STREET SWEEPING (real ArcGIS data) ──────────────────────────
+// Minneapolis PW publishes StreetSweepSpring_vector — per-segment sweep
+// schedule with DATE_ ("MMDD"), DAY_ (weekday), LABEL, STATUS. Data covers
+// the spring sweep (Apr-May); a parallel fall dataset exists but less
+// actively maintained.
+const MINNEAPOLIS_BBOX = { minLat:44.89, maxLat:45.06, minLng:-93.33, maxLng:-93.19 };
+const MINNEAPOLIS_SWEEP_URL =
+  "https://services.arcgis.com/afSMGVsC7QlRK1kZ/arcgis/rest/services/StreetSweepSpring_vector/FeatureServer/0/query";
+function isMinneapolis(lat, lng) {
+  return lat >= MINNEAPOLIS_BBOX.minLat && lat <= MINNEAPOLIS_BBOX.maxLat &&
+         lng >= MINNEAPOLIS_BBOX.minLng && lng <= MINNEAPOLIS_BBOX.maxLng;
+}
+async function minneapolisSweepNear(lat, lng, radiusKm = 1.5) {
+  const degLat = radiusKm / 111;
+  const degLng = radiusKm / (111 * Math.cos(lat * Math.PI / 180));
+  const envelope = {
+    xmin: lng - degLng, ymin: lat - degLat,
+    xmax: lng + degLng, ymax: lat + degLat,
+    spatialReference: { wkid: 4326 },
+  };
+  const params = new URLSearchParams({
+    geometry: JSON.stringify(envelope),
+    geometryType: "esriGeometryEnvelope",
+    spatialRel: "esriSpatialRelIntersects",
+    inSR: "4326",
+    outFields: "STREETALL,DATE_,DAY_,WEEK,LABEL,STATUS",
+    outSR: "4326",
+    returnGeometry: "false",
+    f: "json",
+    resultRecordCount: "2000",
+  });
+  try {
+    const r = await fetch(`${MINNEAPOLIS_SWEEP_URL}?${params}`);
+    if (!r.ok) { console.error("Minneapolis ArcGIS:", r.status); return []; }
+    const data = await r.json();
+    return data.features || [];
+  } catch (e) { console.error("Minneapolis sweep fetch:", e.message); return []; }
+}
+function minneapolisUrgencyFor(attr, now = new Date()) {
+  // DATE_ is "MMDD" e.g. "0427". Compare against today's MMDD in local tz.
+  const d = String(attr.DATE_ || "").trim();
+  if (!d || !/^\d{3,4}$/.test(d)) return null;
+  const mmdd = d.padStart(4, "0");
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago", month: "2-digit", day: "2-digit",
+  }).formatToParts(now);
+  const mm = parts.find(p => p.type === "month").value;
+  const dd = parts.find(p => p.type === "day").value;
+  const todayMMDD = `${mm}${dd}`;
+  const tomorrow = new Date(now.getTime() + 86400000);
+  const tparts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago", month: "2-digit", day: "2-digit",
+  }).formatToParts(tomorrow);
+  const tmm = tparts.find(p => p.type === "month").value;
+  const tdd = tparts.find(p => p.type === "day").value;
+  const tomorrowMMDD = `${tmm}${tdd}`;
+  const label = attr.LABEL ? ` · ${attr.LABEL}` : "";
+  if (mmdd === todayMMDD) return { urgency: "red",    note: `Street sweep today${label}` };
+  if (mmdd === tomorrowMMDD) return { urgency: "red", note: `Street sweep tomorrow${label}` };
+  // Within 48h → yellow
+  const in2 = new Date(now.getTime() + 172800000);
+  const p2 = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago", month: "2-digit", day: "2-digit",
+  }).formatToParts(in2);
+  const in2MMDD = `${p2.find(x=>x.type==="month").value}${p2.find(x=>x.type==="day").value}`;
+  if (mmdd === in2MMDD) return { urgency: "yellow", note: `Street sweep in 2 days${label}` };
+  return null;
+}
+
+// ─── SAN DIEGO STREET SWEEPING (real geojson) ────────────────────────────────
+// 27,977 segments with schedule strings like "Posted (8am - 11am), SS Mon,
+// NS Thu" and "Not Posted, Both Sides 4th Mon". The full geojson is ~19MB
+// and hosted on seshat.datasd.org; we fetch once and cache in memory for
+// the server's lifetime, then spatial-filter per-request via bbox.
+const SD_BBOX = { minLat:32.50, maxLat:33.10, minLng:-117.32, maxLng:-116.80 };
+const SD_SWEEP_URL = "https://seshat.datasd.org/gis_street_sweeping/street_sweeping_datasd.geojson";
+let _sdSweepCache = null;      // array of features
+let _sdSweepLoading = null;    // in-flight promise
+function isSanDiego(lat, lng) {
+  return lat >= SD_BBOX.minLat && lat <= SD_BBOX.maxLat &&
+         lng >= SD_BBOX.minLng && lng <= SD_BBOX.maxLng;
+}
+async function loadSanDiegoSweep() {
+  if (_sdSweepCache) return _sdSweepCache;
+  if (_sdSweepLoading) return _sdSweepLoading;
+  _sdSweepLoading = (async () => {
+    try {
+      const r = await fetch(SD_SWEEP_URL);
+      if (!r.ok) { console.error("SD sweep fetch:", r.status); return []; }
+      const data = await r.json();
+      const feats = (data.features || []).map(f => {
+        // Pre-compute bbox for cheap spatial filter later.
+        const coords = f.geometry?.coordinates || [];
+        let minLng = Infinity, maxLng = -Infinity, minLat = Infinity, maxLat = -Infinity;
+        for (const [lng, lat] of coords) {
+          if (lng < minLng) minLng = lng; if (lng > maxLng) maxLng = lng;
+          if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat;
+        }
+        return {
+          props: f.properties || {},
+          minLng, maxLng, minLat, maxLat,
+        };
+      });
+      _sdSweepCache = feats;
+      console.log(`SD sweep loaded: ${feats.length} segments`);
+      return feats;
+    } catch (e) { console.error("SD sweep load error:", e.message); return []; }
+    finally { _sdSweepLoading = null; }
+  })();
+  return _sdSweepLoading;
+}
+async function sanDiegoSweepNear(lat, lng, radiusKm = 1.5) {
+  const feats = await loadSanDiegoSweep();
+  const degLat = radiusKm / 111;
+  const degLng = radiusKm / (111 * Math.cos(lat * Math.PI / 180));
+  const minLat = lat - degLat, maxLat = lat + degLat;
+  const minLng = lng - degLng, maxLng = lng + degLng;
+  const hits = [];
+  for (const f of feats) {
+    if (f.maxLng < minLng || f.minLng > maxLng) continue;
+    if (f.maxLat < minLat || f.minLat > maxLat) continue;
+    hits.push(f.props);
+  }
+  return hits;
+}
+// Parse "SS Mon, NS Thu" / "Both Sides 4th Mon" / "Both Sides Even Month
+// 4th Fri" into a weekday set. Returns e.g. ["Mon","Thu"].
+const SD_DAY_TOKENS = { MON:"Mon", TUE:"Tue", WED:"Wed", THU:"Thu", FRI:"Fri", SAT:"Sat", SUN:"Sun" };
+function sdSweepDays(schedule) {
+  if (!schedule) return [];
+  const up = schedule.toUpperCase();
+  const days = new Set();
+  for (const tok of Object.keys(SD_DAY_TOKENS)) {
+    if (new RegExp(`\\b${tok}\\b`).test(up)) days.add(SD_DAY_TOKENS[tok]);
+  }
+  return [...days];
+}
+function sanDiegoUrgencyFor(props, now = new Date()) {
+  const schedule = (props.schedule || "").trim();
+  const schedule2 = (props.schedule2 || "").trim();
+  const all = [schedule, schedule2].filter(Boolean).join(" · ");
+  if (!all) return null;
+  const days = [...new Set([...sdSweepDays(schedule), ...sdSweepDays(schedule2)])];
+  if (!days.length) return null;
+  const weekdays = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  const today    = weekdays[new Date(now.toLocaleString("en-US",{timeZone:"America/Los_Angeles"})).getDay()];
+  const tomorrow = weekdays[new Date(new Date(now.getTime()+86400000).toLocaleString("en-US",{timeZone:"America/Los_Angeles"})).getDay()];
+  const in2      = weekdays[new Date(new Date(now.getTime()+172800000).toLocaleString("en-US",{timeZone:"America/Los_Angeles"})).getDay()];
+  if (days.includes(today))    return { urgency: "red",    note: `Sweep today · ${all}` };
+  if (days.includes(tomorrow)) return { urgency: "red",    note: `Sweep tomorrow · ${all}` };
+  if (days.includes(in2))      return { urgency: "yellow", note: `Sweep in 2 days · ${all}` };
+  return null;
+}
+
+// Unified wrapper: for each covered city, fetch real data once per request
+// and build { upperStreetName → {urgency, note} }. The heatmap loop
+// consults this map and elevates matching streets. Cities not covered
+// return null to skip the elevation pass.
+async function cityRealDataMap(lat, lng, streetNames) {
+  const out = {};
+  const fuse = (name, entry) => {
+    const cur = out[name];
+    const rank = u => u === "red" ? 2 : u === "yellow" ? 1 : 0;
+    if (!cur || rank(entry.urgency) > rank(cur.urgency)) out[name] = entry;
+  };
+  if (isDenver(lat, lng)) {
+    const feats = await denverRestrictionsNear(lat, lng, 1.5);
+    console.log(`Denver parking restrictions: ${feats.length} segments`);
+    for (const f of feats) {
+      const name = normStreet(f.attributes?.FULLNAME);
+      if (!name) continue;
+      const u = denverUrgencyFor(f.attributes);
+      if (u) fuse(name, u);
+    }
+  } else if (isMinneapolis(lat, lng)) {
+    const feats = await minneapolisSweepNear(lat, lng, 1.5);
+    console.log(`Minneapolis sweep segments: ${feats.length}`);
+    for (const f of feats) {
+      const name = normStreet(f.attributes?.STREETALL);
+      if (!name) continue;
+      const u = minneapolisUrgencyFor(f.attributes);
+      if (u) fuse(name, u);
+    }
+  } else if (isSanDiego(lat, lng)) {
+    const rows = await sanDiegoSweepNear(lat, lng, 1.5);
+    console.log(`SD sweep segments near: ${rows.length}`);
+    for (const p of rows) {
+      const name = normStreet(p.rd20full);
+      if (!name) continue;
+      const u = sanDiegoUrgencyFor(p);
+      if (u) fuse(name, u);
+    }
+  } else {
+    return null;
+  }
+  return out;
+}
+
 // ─── PARKING HEAT MAP — OpenStreetMap via Overpass ───────────────────────────
 app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v27:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v28:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   // Stale-while-revalidate: if we have ANY cached entry (fresh or stale),
   // serve it immediately so polylines render the moment the map opens.
@@ -2211,6 +2479,30 @@ Return ONLY the JSON object:`, 4000);
       const dist = haversineKm(+lat, +lng, blat, blng);
       if (dist < bestDist) { bestDist = dist; nycBorough = name; }
     }
+    // Real-city data pass for Denver / Minneapolis / San Diego — elevates
+    // green/gray streets when a matching record exists. Runs BEFORE the NYC
+    // sign pass so NYC's borough lookup is untouched.
+    try {
+      const cityMap = await cityRealDataMap(+lat, +lng, streetNames);
+      if (cityMap) {
+        let elev = 0;
+        for (const r of result) {
+          const e = cityMap[r.street];
+          if (!e) continue;
+          if (e.urgency === "red" && r.urgency !== "red") {
+            r.urgency = "red";
+            r.nextClean = e.note;
+            elev++;
+          } else if (e.urgency === "yellow" && (r.urgency === "green" || r.urgency === "gray")) {
+            r.urgency = "yellow";
+            r.nextClean = e.note;
+            elev++;
+          }
+        }
+        if (elev > 0) console.log(`City-real elevated ${elev} streets (lat=${lat},lng=${lng})`);
+      }
+    } catch (e) { console.error("City real-data pass error:", e.message); }
+
     if (nycBorough && bestDist < 30) {
       try {
         const signUrgency = await nycSignsForHeatmap(streetNames, nycBorough);

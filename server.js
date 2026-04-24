@@ -1517,7 +1517,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v19:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v20:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1572,7 +1572,8 @@ app.get("/api/heatmap", async (req, res) => {
       // keep the normal green default outside the downtown bbox.
       const CITY_PROFILES = [
         // Dallas SEC 28-84 — https://codelibrary.amlegal.com/codes/dallas/latest/dallas_tx/0-0-0-112892
-        { name:"Dallas", bbox:{ minLat:32.61, maxLat:32.99, minLng:-96.99, maxLng:-96.57 },
+        { name:"Dallas", isStrict24h:true,
+          bbox:{ minLat:32.61, maxLat:32.99, minLng:-96.99, maxLng:-96.57 },
           ordinance:"SEC 28-84",
           note:"Dallas 24-hour street parking limit · move within a day or risk tow",
           meteredStreets: new Set([
@@ -1588,7 +1589,8 @@ app.get("/api/heatmap", async (req, res) => {
         // Nashville Metro Code 12.40 — move every 24h per NDOT Parking
         // Enforcement (nashville.gov). Downtown CBD meters enforced 24/7
         // per Nashville Downtown Partnership guide.
-        { name:"Nashville", bbox:{ minLat:36.03, maxLat:36.35, minLng:-87.05, maxLng:-86.53 },
+        { name:"Nashville", isStrict24h:true,
+          bbox:{ minLat:36.03, maxLat:36.35, minLng:-87.05, maxLng:-86.53 },
           ordinance:"Metro Code 12.40",
           note:"Nashville 24-hour street parking limit · move every day or risk tow",
           meteredStreets: new Set([

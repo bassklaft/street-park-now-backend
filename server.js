@@ -746,15 +746,31 @@ app.get("/api/geocode", async (req, res) => {
           let usResult = null;
           if (usResults.length === 0) {
             // fall through
-          } else if (userLat && userLng && usResults.length > 1) {
+          } else if (userLat && userLng) {
+            // Always run the nearest-pick when GPS is available, even with a
+            // single result — so we can reject it if it's implausibly far
+            // away (Pensacola for a NYC user means "not a real match").
             const uLat = +userLat, uLng = +userLng;
-            usResult = usResults.slice().sort((a, b) => {
+            const sorted = usResults.slice().sort((a, b) => {
               const da = haversineKm(uLat, uLng, a.geometry.location.lat, a.geometry.location.lng);
               const db = haversineKm(uLat, uLng, b.geometry.location.lat, b.geometry.location.lng);
               return da - db;
-            })[0];
-            const dPick = haversineKm(uLat, uLng, usResult.geometry.location.lat, usResult.geometry.location.lng).toFixed(2);
-            console.log(`Geocode "${q}" — picked nearest of ${usResults.length} US/CA results (${dPick} km from user)`);
+            });
+            const nearest = sorted[0];
+            const dPick = haversineKm(uLat, uLng, nearest.geometry.location.lat, nearest.geometry.location.lng);
+            console.log(`Geocode "${q}" — nearest of ${usResults.length} US/CA results is ${dPick.toFixed(2)} km from user`);
+            // Reject when the ONLY candidate is on the other side of the
+            // country — it almost always means the house number doesn't
+            // exist near the user, and silently routing to a wrong-state
+            // match is worse than telling them to add city context.
+            const MAX_KM_FROM_USER = 150;
+            if (dPick > MAX_KM_FROM_USER) {
+              console.log(`Geocode "${q}" — nearest result ${dPick.toFixed(0)} km away (>${MAX_KM_FROM_USER}); rejecting`);
+              return res.status(404).json({
+                error: `"${q}" doesn't match any address near you. Try adding a city (e.g. "${q}, Brooklyn").`
+              });
+            }
+            usResult = nearest;
           } else {
             usResult = usResults[0];
           }

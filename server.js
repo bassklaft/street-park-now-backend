@@ -1504,7 +1504,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v13:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v14:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1644,7 +1644,6 @@ Return ONLY the JSON object:`, 4000);
     //     which lied to users about cities like Dallas where no structured
     //     data exists. Gray is the honest answer when we have no signal.
     let osmRedCount = 0, osmYellowCount = 0;
-    let meteredCount = 0;
     const result = ways.map(w => {
       const name = normStreet(w.tags.name);
       const sch = schedulesByKey[name] || [];
@@ -1653,28 +1652,24 @@ Return ONLY the JSON object:`, 4000);
       let nextClean = null;
 
       if (sch.length) {
-        // Walk every rule once and bucket them:
-        //   - Cleaning + today/tomorrow     -> hardest signal, becomes red
-        //   - Cleaning + in 2-3 days        -> yellow
-        //   - Any non-cleaning rule (metered/permit/rush_hour) active today
-        //                                   -> yellow ("restrictions apply")
-        // A street with ANY cleaning rule at all and none of the above matches
-        // is "green" — we have confirmed data and the next move is >=4 days
-        // away. Only streets with zero usable rules fall through to gray.
-        let cleaningRed = null;       // { time } for today/tomorrow cleaning
-        let cleaningSoon = null;      // { time } for 2-3 day cleaning
-        let restrictionToday = null;  // { kind, time } for metered/rush/permit today
+        // Only `kind: "cleaning"` rules drive color. Metered / rush-hour /
+        // permit entries come back from the same Claude call but are
+        // informational — they surface in /api/cleaning-batch for the
+        // results-page card, not here. Coloring entire streets yellow
+        // because Claude guessed "metered" turned Dallas into a sea of
+        // yellow from hallucinated coverage.
+        let cleaningRed = null;
+        let cleaningSoon = null;
         let anyCleaning = false;
         for (const s of sch) {
-          const days = s.days || [];
           const isCleaning = !s.kind || s.kind === "cleaning";
-          if (isCleaning) {
-            anyCleaning = true;
-            if (!cleaningRed && days.includes(today))    cleaningRed  = { when: "Today", time: s.time || "" };
-            else if (!cleaningRed && days.includes(tomorrow)) cleaningRed = { when: "Tomorrow", time: s.time || "" };
-            else if (!cleaningSoon && (days.includes(in2days) || days.includes(in3days))) cleaningSoon = { when: "In 2-3 days", time: s.time || "" };
-          } else if (!restrictionToday && days.includes(today)) {
-            restrictionToday = { kind: s.kind, time: s.time || "" };
+          if (!isCleaning) continue;
+          anyCleaning = true;
+          const days = s.days || [];
+          if (!cleaningRed && days.includes(today))         cleaningRed  = { when: "Today",    time: s.time || "" };
+          else if (!cleaningRed && days.includes(tomorrow)) cleaningRed  = { when: "Tomorrow", time: s.time || "" };
+          else if (!cleaningSoon && (days.includes(in2days) || days.includes(in3days))) {
+            cleaningSoon = { when: "In 2-3 days", time: s.time || "" };
           }
         }
         if (cleaningRed) {
@@ -1683,35 +1678,30 @@ Return ONLY the JSON object:`, 4000);
         } else if (cleaningSoon) {
           urgency = "yellow";
           nextClean = `${cleaningSoon.when} ${cleaningSoon.time}`.trim();
-        } else if (restrictionToday) {
-          urgency = "yellow";
-          const label = restrictionToday.kind === "metered" ? "Metered"
-                     : restrictionToday.kind === "rush_hour" ? "Rush-hour no parking"
-                     : restrictionToday.kind === "permit" ? "Permit only"
-                     : restrictionToday.kind;
-          nextClean = `${label} today ${restrictionToday.time}`.trim();
-          meteredCount++;
         } else if (anyCleaning) {
           urgency = "green";
+        } else {
+          // Schedule entries returned but no cleaning among them — treat as
+          // no-known-restriction → green (was gray, which read as "missing data").
+          urgency = "green";
         }
-        // Otherwise stays gray — schedule entries that we couldn't bucket
-        // mean we're probably misinterpreting the data; don't call it safe.
       } else {
         const osm = osmParkingStatus(w.tags);
         if (osm) {
           urgency = osm.urgency;
           nextClean = `OSM tag: ${osm.source}`;
           if (osm.urgency === "red") osmRedCount++; else if (osm.urgency === "yellow") osmYellowCount++;
+        } else {
+          // No schedule and no OSM tag — default to green ("no known
+          // scheduled restriction"). Yellow is reserved for actual
+          // scheduled restriction data (cleaning in 2-3 days).
+          urgency = "green";
         }
-        // else: urgency stays gray — we have no data for this street.
       }
       return { street: name, coords, urgency, nextClean };
     });
     if (osmRedCount + osmYellowCount > 0) {
       console.log(`OSM tag classification: red=${osmRedCount} yellow=${osmYellowCount}`);
-    }
-    if (meteredCount > 0) {
-      console.log(`Non-cleaning restrictions (metered/rush-hour/permit): ${meteredCount}`);
     }
 
     // NYC-only post-pass: consult nfid-uabd signs and elevate per-street

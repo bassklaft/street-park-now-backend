@@ -1517,7 +1517,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v16:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v17:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1566,17 +1566,16 @@ app.get("/api/heatmap", async (req, res) => {
       +lat >= b.minLat && +lat <= b.maxLat && +lng >= b.minLng && +lng <= b.maxLng
     );
     if (!cleaningCity) {
-      // "Strict 24-hour" cities: municipal ordinance caps overnight parking on
-      // any city street. Default to yellow (not green) so we don't falsely
-      // imply "safe for 4+ days." Dallas SEC 28-84 explicitly prohibits
-      // parking > 24 consecutive hours citywide; verified at
-      // codelibrary.amlegal.com/codes/dallas/latest/dallas_tx/0-0-0-112892.
+      // "Strict 24-hour" cities: municipal ordinance caps overnight parking
+      // on any city street. Default to yellow (not green) so we don't
+      // falsely imply "safe for 4+ days." Each entry cites the actual
+      // ordinance + has a downtown-metered allowlist pulled from the city
+      // parking authority's published street list.
       const STRICT_24H_CITIES = [
+        // Dallas SEC 28-84 — https://codelibrary.amlegal.com/codes/dallas/latest/dallas_tx/0-0-0-112892
         { name:"Dallas", bbox:{ minLat:32.61, maxLat:32.99, minLng:-96.99, maxLng:-96.57 },
           ordinance:"SEC 28-84",
           note:"Dallas 24-hour street parking limit · move within a day or risk tow",
-          // Downtown arterials with posted meter enforcement per dallascityhall.com
-          // and parkmobile.io references. Names are in our normStreet() form.
           meteredStreets: new Set([
             "MAIN STREET", "ELM STREET", "COMMERCE STREET",
             "AKARD STREET", "ERVAY STREET", "FIELD STREET",
@@ -1585,6 +1584,38 @@ app.get("/api/heatmap", async (req, res) => {
             "BRYAN STREET", "JACKSON STREET", "WOOD STREET",
           ]),
           meteredBbox:{ minLat:32.77, maxLat:32.79, minLng:-96.81, maxLng:-96.79 },
+          meteredText:"Metered · Mon-Sat business hours (check meter)",
+        },
+        // Nashville Metro Code 12.40 — move every 24h per NDOT Parking
+        // Enforcement (nashville.gov). Downtown CBD meters enforced 24/7
+        // per Nashville Downtown Partnership guide.
+        { name:"Nashville", bbox:{ minLat:36.03, maxLat:36.35, minLng:-87.05, maxLng:-86.53 },
+          ordinance:"Metro Code 12.40",
+          note:"Nashville 24-hour street parking limit · move every day or risk tow",
+          meteredStreets: new Set([
+            "BROADWAY", "CHURCH STREET", "COMMERCE STREET", "UNION STREET",
+            "DEMONBREUN STREET", "CHARLOTTE AVENUE", "KOREAN VETERANS BOULEVARD",
+            "2ND AVENUE NORTH", "2ND AVENUE SOUTH", "3RD AVENUE NORTH",
+            "3RD AVENUE SOUTH", "4TH AVENUE NORTH", "4TH AVENUE SOUTH",
+            "5TH AVENUE NORTH", "5TH AVENUE SOUTH", "6TH AVENUE NORTH",
+            "6TH AVENUE SOUTH", "7TH AVENUE NORTH", "8TH AVENUE SOUTH",
+          ]),
+          meteredBbox:{ minLat:36.14, maxLat:36.18, minLng:-86.79, maxLng:-86.76 },
+          meteredText:"Metered · Downtown CBD (often enforced 24/7 — check signs)",
+        },
+        // Houston Ordinance 26-93 — "vehicle cannot legally park on public
+        // street for more than 24 hours" (houstontx.gov/parking).
+        { name:"Houston", bbox:{ minLat:29.52, maxLat:30.11, minLng:-95.78, maxLng:-95.02 },
+          ordinance:"Ordinance 26-93",
+          note:"Houston 24-hour street parking limit · move every day or risk tow",
+          meteredStreets: new Set([
+            "MAIN STREET", "CAPITOL STREET", "RUSK STREET", "TRAVIS STREET",
+            "MILAM STREET", "LOUISIANA STREET", "SMITH STREET", "FANNIN STREET",
+            "BRAZOS STREET", "CAROLINE STREET", "SAN JACINTO STREET",
+            "WALKER STREET", "LAMAR STREET", "PRAIRIE STREET", "TEXAS AVENUE",
+            "POLK STREET", "DALLAS STREET", "MCKINNEY STREET", "CLAY STREET",
+          ]),
+          meteredBbox:{ minLat:29.74, maxLat:29.77, minLng:-95.38, maxLng:-95.35 },
           meteredText:"Metered · Mon-Sat business hours (check meter)",
         },
       ];

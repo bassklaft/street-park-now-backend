@@ -1140,12 +1140,28 @@ function categorizeSign(desc) {
   if (!u) return null;
   // Filter out street cleaning — those belong to the /api/cleaning category.
   if (u.includes("STREET CLEANING") || u.includes("BROOM")) return null;
+  // Always-active first (point-specific restrictions).
   if (u.includes("NO PARKING ANYTIME") || u.includes("NO STANDING ANYTIME")) return "no_parking_always";
   if (u.includes("FIRE ")) return "fire_zone";
   if (u.includes("BUS STOP")) return "bus_stop";
   if (u.includes("TOW AWAY") || u.includes("TOW-AWAY")) return "tow_away";
+  // Time-limited, stacked before "no parking hours" so they don't collide.
   if (u.includes("LOADING") || u.includes("TRUCK")) return "loading_zone";
-  if (u.includes("AUTHORIZED") || u.includes("PERMIT")) return "permit_only";
+  // School-zone restrictions: "SCHOOL DAYS 7:30AM-4PM" — active weekdays only,
+  // during school year. Separate bucket so the heatmap can handle the
+  // weekday-only behavior.
+  if (u.includes("SCHOOL")) return "school_zone";
+  // Authorized/diplomat/consulate/police — curb is reserved for permit holders.
+  if (u.includes("AUTHORIZED VEHICLES") || u.includes("DIPLOMAT") ||
+      u.includes("CONSULATE") || u.includes("POLICE VEHICLES") ||
+      u.includes("DEPARTMENT VEHICLES")) return "authorized_only";
+  if (u.includes("PERMIT")) return "permit_only";
+  // Overnight no parking: "MIDNIGHT-3AM TUE/FRI", "11PM-7AM", "ALL NIGHT".
+  if ((/MIDNIGHT|\bALL NIGHT\b/.test(u) ||
+       /(1[01]|[0-9])\s*PM.*?(1[0-2]|[0-9])\s*AM/.test(u)) &&
+      (u.includes("NO PARKING") || u.includes("NO STANDING"))) {
+    return "overnight_no_parking";
+  }
   // "2 HMP", "1 HR PARKING", "HOUR METERED", "HOUR PARKING"
   if (/\b\d+\s*(HMP|HR|HOUR)\b/.test(u)) return "time_limit";
   if (u.includes("NO PARKING") && (u.includes("AM") || u.includes("PM"))) return "no_parking_hours";
@@ -1198,6 +1214,63 @@ function extractSignDays(desc) {
     for (const d of DAYS_WEEK) if (d !== excluded) days.add(d);
   }
   return days.size ? [...days] : null;
+}
+
+// Parse a sign's time window. Handles "8AM-7PM", "MIDNIGHT-3AM",
+// "8:30AM TO 4PM", "11PM - 7AM" (wraps past midnight). Returns
+// {startMin, endMin, wraps} in minutes-from-midnight, or null.
+function extractSignTimeRange(desc) {
+  const u = (desc || "").toUpperCase();
+  if (!u) return null;
+  const toMin = (h, m, ap) => {
+    let hr = parseInt(h, 10);
+    const min = m ? parseInt(m, 10) : 0;
+    if (ap === "PM" && hr < 12) hr += 12;
+    if (ap === "AM" && hr === 12) hr = 0;
+    return hr * 60 + min;
+  };
+  // MIDNIGHT as a shorthand
+  const withMidnight = u.replace(/\bMIDNIGHT\b/g, "12AM").replace(/\bNOON\b/g, "12PM");
+  // Matches 12 / 12:30 / 12AM / 12:30 PM etc; each side may omit AM/PM
+  // (in which case we infer from the other side).
+  const re = /(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?\s*(?:-|TO|THRU)\s*(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/;
+  const m = withMidnight.match(re);
+  if (!m) return null;
+  let ap1 = m[3], ap2 = m[6];
+  if (!ap1 && ap2) ap1 = ap2;
+  if (!ap2 && ap1) ap2 = ap1;
+  if (!ap1 && !ap2) return null;
+  const s = toMin(m[1], m[2], ap1);
+  const e = toMin(m[4], m[5], ap2);
+  if (Number.isNaN(s) || Number.isNaN(e)) return null;
+  const wraps = e <= s; // e.g. 11PM -> 7AM crosses midnight
+  return { startMin: s, endMin: e, wraps };
+}
+
+// Is a sign active right now in the "America/New_York" tz? Considers both
+// the weekday set AND the time-of-day window. Returns true/false/null where
+// null means "sign has no day+time window we can evaluate" (always-active).
+function isSignActiveNow(desc, now = new Date()) {
+  const days = extractSignDays(desc);
+  const range = extractSignTimeRange(desc);
+  // Always-active signs are handled separately — bail.
+  if (!days && !range) return null;
+  // NYC timezone — convert now to local weekday + minute-of-day.
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short", hour: "numeric", minute: "numeric", hour12: false,
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(now).map(p => [p.type, p.value]));
+  const weekday = parts.weekday;
+  const hr = parseInt(parts.hour, 10);
+  const min = parseInt(parts.minute, 10);
+  const curMin = hr * 60 + min;
+  if (days && !days.includes(weekday)) return false;
+  if (!range) return true; // day matches, no time window = all-day on that day
+  if (range.wraps) {
+    return curMin >= range.startMin || curMin <= range.endMin;
+  }
+  return curMin >= range.startMin && curMin <= range.endMin;
 }
 
 // EPSG:2263 (NY State Plane Long Island, NAD83, US survey ft) → WGS84.
@@ -1315,11 +1388,12 @@ async function nycPointRestrictions(lat, lng, radiusKm = 1) {
 
 // For each NYC street in the batch, look up active sign restrictions from
 // nfid-uabd and return the urgency that signs alone would suggest:
-//   "red"    — restriction covers today
-//   "yellow" — restriction covers tomorrow or the day after
+//   "red"    — ANY restriction is active right now or today
+//   "yellow" — restriction covers tomorrow or the day after (next 48h)
 //   null     — no actionable elevation
-// Also returns a short sample of the sign text so the heatmap's nextClean
-// field can show "NO PARKING 7-9AM MON" next to the urgency color.
+// Also returns samples[] with ALL matched signs per street so the frontend
+// can render stacked signs (cleaning + school + overnight etc.) not just
+// the first found.
 async function nycSignsForHeatmap(streets, borough) {
   if (!streets.length || !borough) return {};
   const boroughProper = borough.toLowerCase().includes("staten") ? "Staten Island"
@@ -1328,7 +1402,7 @@ async function nycSignsForHeatmap(streets, borough) {
     .map(s => `upper(on_street) LIKE '%${String(s).replace(/'/g,"''").toUpperCase()}%'`)
     .join(" OR ");
   const where = `record_type='Current' AND borough='${boroughProper}' AND (${namePredicates})`;
-  const url = `https://data.cityofnewyork.us/resource/nfid-uabd.json?$where=${encodeURIComponent(where)}&$select=on_street,sign_description&$limit=1500`;
+  const url = `https://data.cityofnewyork.us/resource/nfid-uabd.json?$where=${encodeURIComponent(where)}&$select=on_street,sign_description&$limit=3000`;
   let rows = [];
   try {
     const r = await fetch(url);
@@ -1336,12 +1410,15 @@ async function nycSignsForHeatmap(streets, borough) {
     rows = await r.json();
   } catch (e) { console.error("nfid-uabd heatmap fetch error:", e.message); return {}; }
 
-  const todayAbbr    = DAYS_WEEK[new Date().getDay()];
-  const tomorrowAbbr = DAYS_WEEK[new Date(Date.now()+86400000).getDay()];
-  const in2Abbr      = DAYS_WEEK[new Date(Date.now()+86400000*2).getDay()];
-  const in3Abbr      = DAYS_WEEK[new Date(Date.now()+86400000*3).getDay()];
+  const now = new Date();
+  const todayAbbr    = DAYS_WEEK[now.getDay()];
+  const tomorrowAbbr = DAYS_WEEK[new Date(now.getTime()+86400000).getDay()];
+  const in2Abbr      = DAYS_WEEK[new Date(now.getTime()+86400000*2).getDay()];
 
-  const result = {}; // { street: { urgency, sample } }
+  // { street: { urgency, sample, samples: [{type, text, urgency}] } }
+  const result = {};
+  const rank = u => (u === "red" ? 2 : u === "yellow" ? 1 : 0);
+
   for (const row of rows) {
     const onStreet = String(row.on_street || "").toUpperCase().trim();
     if (!onStreet) continue;
@@ -1349,26 +1426,46 @@ async function nycSignsForHeatmap(streets, borough) {
     if (!match) continue;
     const type = categorizeSign(row.sign_description);
     if (!type) continue;
-    // Skip always-active signs ("NO PARKING ANYTIME", fire zones, tow-away,
-    // bus stops) here. These apply to specific points on the curb (hydrants,
-    // driveway cuts, bus stop zones) — elevating an entire street polyline
-    // to red because one such sign exists makes the map unusable. They still
-    // show per-block in the /api/restrictions "Other Parking Restrictions"
-    // card where the spatial granularity fits.
-    if (type === "no_parking_always" || type === "fire_zone" || type === "tow_away" || type === "bus_stop") {
+    // Always-active point-specific signs (fire zones, bus stops, no-standing-
+    // anytime at a hydrant, tow-away at a driveway cut) elevate a street to
+    // red if you take them literally. But because they apply to single curb
+    // spots the polyline shouldn't go red citywide. Keep them out of the
+    // heatmap pass — they're already shown per-spot as dots and per-block in
+    // the "Other Parking Restrictions" card.
+    if (type === "no_parking_always" || type === "fire_zone" ||
+        type === "tow_away" || type === "bus_stop") {
       continue;
     }
-    // Day-based: red if today is listed, yellow if tomorrow or 2-3 days.
-    const days = extractSignDays(row.sign_description);
-    if (!days || !days.length) continue;
+
+    const cleaned = cleanSignText(row.sign_description);
     let up = null;
-    if (days.includes(todayAbbr)) up = "red";
-    else if (days.includes(tomorrowAbbr) || days.includes(in2Abbr) || days.includes(in3Abbr)) up = "yellow";
-    if (!up) continue;
-    const cur = result[match];
-    if (!cur || (cur.urgency === "yellow" && up === "red")) {
-      result[match] = { urgency: up, sample: cleanSignText(row.sign_description).slice(0,60) };
+    // Active right now (correct weekday + in time window) → red.
+    const activeNow = isSignActiveNow(row.sign_description, now);
+    if (activeNow === true) {
+      up = "red";
+    } else {
+      const days = extractSignDays(row.sign_description);
+      if (days && days.length) {
+        if (days.includes(todayAbbr)) up = "red";                        // today but outside window
+        else if (days.includes(tomorrowAbbr) || days.includes(in2Abbr)) up = "yellow"; // within 48h
+      }
     }
+    if (!up) continue;
+
+    if (!result[match]) result[match] = { urgency: up, sample: cleaned.slice(0,60), samples: [] };
+    if (rank(up) > rank(result[match].urgency)) {
+      result[match].urgency = up;
+      result[match].sample  = cleaned.slice(0,60);
+    }
+    // Capture stacked signs — dedupe by normalized text.
+    const key = cleaned.toUpperCase();
+    if (!result[match].samples.some(x => x._k === key)) {
+      result[match].samples.push({ _k: key, type, text: cleaned.slice(0, 80), urgency: up });
+    }
+  }
+  // Trim internal dedup keys and cap samples per street for payload size.
+  for (const k of Object.keys(result)) {
+    result[k].samples = result[k].samples.slice(0, 8).map(({_k, ...rest}) => rest);
   }
   return result;
 }
@@ -1483,8 +1580,10 @@ app.get("/api/restrictions", async (req, res) => {
     // Sort each street's list by urgency bucket so the worst restrictions
     // surface first when the frontend caps a list.
     const TYPE_RANK = {
-      tow_away: 0, fire_zone: 1, no_parking_always: 2, bus_stop: 3,
-      no_parking_hours: 4, time_limit: 5, loading_zone: 6, permit_only: 7,
+      tow_away: 0, fire_zone: 1, no_parking_always: 2,
+      overnight_no_parking: 3, bus_stop: 4, no_parking_hours: 5,
+      school_zone: 6, time_limit: 7, loading_zone: 8,
+      permit_only: 9, authorized_only: 10,
     };
     for (const k of Object.keys(result)) {
       result[k].sort((a, b) => (TYPE_RANK[a.type] ?? 99) - (TYPE_RANK[b.type] ?? 99));
@@ -1502,22 +1601,39 @@ app.get("/api/restrictions", async (req, res) => {
 // parking:right / parking:both schema, plus common truck/standing variants.
 function osmParkingStatus(tags) {
   if (!tags) return null;
-  const RESTRICTION_VALUES = new Set(["no_parking", "no_stopping", "no_standing", "fire_lane"]);
+  const RESTRICTION_VALUES = new Set([
+    "no_parking", "no_stopping", "no_standing", "fire_lane",
+    "no", "none", "prohibited",
+  ]);
   const keys = Object.keys(tags);
-  // Pass 1: absolute-restriction values on any parking-ish key.
+  // Pass 1: absolute-restriction values on any parking-ish key — includes
+  // parking:condition, parking:left:restriction, parking:both:restriction,
+  // parking:lane:*:restriction, the old no_parking=yes convention, and
+  // parking:condition:left/right/both. Many non-NYC cities populate these
+  // directly from sign surveys.
   for (const k of keys) {
     if (!/^(parking[:_]|no_parking$)/.test(k)) continue;
     const v = String(tags[k] ?? "").toLowerCase();
     if (RESTRICTION_VALUES.has(v) || (k === "no_parking" && (v === "yes" || v === "true"))) {
       return { urgency: "red", source: `${k}=${v}` };
     }
+    // parking:condition:*=ticket / customers / residents / disc / charged
+    if (/condition/i.test(k) && /^(ticket|disc|charged|customers|residents|private|permit|loading)$/.test(v)) {
+      return { urgency: "yellow", source: `${k}=${v}` };
+    }
   }
-  // Pass 2: time-limited parking via maxstay.
+  // Pass 2: time-limited parking via maxstay or any parking:condition:*:time.
   for (const k of keys) {
-    if (!k.toLowerCase().includes("maxstay")) continue;
+    const lk = k.toLowerCase();
+    if (!(lk.includes("maxstay") || (lk.includes("parking:condition") && lk.includes("time")))) continue;
     return { urgency: "yellow", source: `${k}=${tags[k]}` };
   }
-  // Pass 3: named restriction relations / access limits surfaced on ways.
+  // Pass 3: hours-restricted parking (parking:condition:*:hours=Mo-Fr 08:00-18:00)
+  for (const k of keys) {
+    if (!/parking:condition.*(hours|maxstay)/i.test(k)) continue;
+    return { urgency: "yellow", source: `${k}=${tags[k]}` };
+  }
+  // Pass 4: named restriction relations / access limits surfaced on ways.
   if (tags["restriction"] && /no_parking|no_stopping/i.test(tags["restriction"])) {
     return { urgency: "red", source: `restriction=${tags["restriction"]}` };
   }
@@ -1529,7 +1645,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v23:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v24:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   // Stale-while-revalidate: if we have ANY cached entry (fresh or stale),
   // serve it immediately so polylines render the moment the map opens.
@@ -1962,7 +2078,6 @@ Return ONLY the JSON object:`, 4000);
         for (const r of result) {
           const s = signUrgency[r.street];
           if (!s) continue;
-          const before = r.urgency;
           if (s.urgency === "red" && r.urgency !== "red") {
             r.urgency = "red";
             r.nextClean = `Sign: ${s.sample}`;
@@ -1972,6 +2087,9 @@ Return ONLY the JSON object:`, 4000);
             r.nextClean = `Sign: ${s.sample}`;
             signElevated++;
           }
+          // Always attach stacked sign samples so the frontend can render
+          // "cleaning + school zone + overnight no-parking" on one street.
+          if (Array.isArray(s.samples) && s.samples.length) r.signs = s.samples;
         }
         if (signElevated > 0) console.log(`NYC signs elevated ${signElevated} streets (borough=${nycBorough})`);
       } catch (e) { console.error("NYC signs elevation error:", e.message); }

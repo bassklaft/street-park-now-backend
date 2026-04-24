@@ -1211,11 +1211,13 @@ async function nycSignsForHeatmap(streets, borough) {
     if (!match) continue;
     const type = categorizeSign(row.sign_description);
     if (!type) continue;
-    // "Anytime" restrictions are always active → red.
-    if (type === "no_parking_always" || type === "fire_zone" || type === "tow_away") {
-      if (!result[match] || result[match].urgency !== "red") {
-        result[match] = { urgency: "red", sample: cleanSignText(row.sign_description).slice(0,60) };
-      }
+    // Skip always-active signs ("NO PARKING ANYTIME", fire zones, tow-away,
+    // bus stops) here. These apply to specific points on the curb (hydrants,
+    // driveway cuts, bus stop zones) — elevating an entire street polyline
+    // to red because one such sign exists makes the map unusable. They still
+    // show per-block in the /api/restrictions "Other Parking Restrictions"
+    // card where the spatial granularity fits.
+    if (type === "no_parking_always" || type === "fire_zone" || type === "tow_away" || type === "bus_stop") {
       continue;
     }
     // Day-based: red if today is listed, yellow if tomorrow or 2-3 days.
@@ -1361,7 +1363,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v12:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v13:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);

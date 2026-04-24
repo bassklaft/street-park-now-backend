@@ -349,6 +349,110 @@ async function chicagoNearbyEvents(lat, lng, radiusMi = 0.5) {
   return results;
 }
 
+// ─── MAJOR SPORTS VENUES (ESPN public scoreboard) ────────────────────────────
+// Proximity table used to surface home-game events near the user. Covers the
+// Chicago / NYC / LA venues the product cares about plus a few expansion
+// candidates; extend as new cities get real-data coverage.
+const SPORTS_VENUES = [
+  // Chicago
+  { key: "Soldier Field",          lat: 41.8624, lng: -87.6167, city: "Chicago",   leagues: ["nfl"] },
+  { key: "Wrigley Field",          lat: 41.9484, lng: -87.6553, city: "Chicago",   leagues: ["mlb"] },
+  { key: "Guaranteed Rate Field",  lat: 41.8300, lng: -87.6339, city: "Chicago",   leagues: ["mlb"] },
+  { key: "Rate Field",             lat: 41.8300, lng: -87.6339, city: "Chicago",   leagues: ["mlb"] }, // rebrand
+  { key: "United Center",          lat: 41.8807, lng: -87.6742, city: "Chicago",   leagues: ["nba","nhl"] },
+  // NYC metro
+  { key: "MetLife Stadium",        lat: 40.8135, lng: -74.0745, city: "East Rutherford", leagues: ["nfl"] },
+  { key: "Yankee Stadium",         lat: 40.8296, lng: -73.9262, city: "Bronx",     leagues: ["mlb"] },
+  { key: "Citi Field",             lat: 40.7571, lng: -73.8458, city: "Queens",    leagues: ["mlb"] },
+  { key: "Madison Square Garden",  lat: 40.7505, lng: -73.9934, city: "New York",  leagues: ["nba","nhl"] },
+  // LA metro
+  { key: "SoFi Stadium",           lat: 33.9535, lng: -118.3392,city: "Inglewood", leagues: ["nfl"] },
+  { key: "Crypto.com Arena",       lat: 34.0430, lng: -118.2673,city: "Los Angeles",leagues: ["nba","nhl"] },
+  { key: "Dodger Stadium",         lat: 34.0739, lng: -118.2400,city: "Los Angeles",leagues: ["mlb"] },
+];
+
+const ESPN_LEAGUE_PATHS = {
+  nfl: "football/nfl",
+  nba: "basketball/nba",
+  mlb: "baseball/mlb",
+  nhl: "hockey/nhl",
+};
+
+const _leagueScheduleCache = new Map(); // league -> {events, ts}
+const LEAGUE_SCHEDULE_TTL = 3 * 3600 * 1000; // 3h
+
+async function fetchLeagueSchedule(league) {
+  const cached = _leagueScheduleCache.get(league);
+  if (cached && Date.now() - cached.ts < LEAGUE_SCHEDULE_TTL) return cached.events;
+  const pathSeg = ESPN_LEAGUE_PATHS[league];
+  if (!pathSeg) return [];
+  const fmt = d => d.toISOString().slice(0,10).replace(/-/g,"");
+  const start = new Date();
+  const end = new Date(Date.now() + 14 * 86400000);
+  const url = `https://site.api.espn.com/apis/site/v2/sports/${pathSeg}/scoreboard?dates=${fmt(start)}-${fmt(end)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) { console.error(`ESPN ${league} status ${r.status}`); return []; }
+    const data = await r.json();
+    const events = data.events || [];
+    _leagueScheduleCache.set(league, { events, ts: Date.now() });
+    return events;
+  } catch (e) {
+    console.error(`ESPN ${league} fetch:`, e.message);
+    return [];
+  }
+}
+
+async function fetchSportsEventsNear(lat, lng, radiusKm = 3) {
+  const lt = +lat, ln = +lng;
+  const nearby = SPORTS_VENUES.filter(v => haversineKm(lt, ln, v.lat, v.lng) <= radiusKm);
+  if (!nearby.length) return [];
+  const leaguesNeeded = [...new Set(nearby.flatMap(v => v.leagues))];
+  const schedules = await Promise.all(
+    leaguesNeeded.map(async l => ({ l, events: await fetchLeagueSchedule(l) }))
+  );
+  const out = [];
+  for (const venue of nearby) {
+    const dist = haversineKm(lt, ln, venue.lat, venue.lng);
+    const venueKeyLower = venue.key.toLowerCase();
+    for (const { l, events } of schedules) {
+      if (!venue.leagues.includes(l)) continue;
+      for (const ev of events) {
+        const comp = ev.competitions?.[0] || {};
+        const venueName = String(comp.venue?.fullName || "").toLowerCase();
+        if (!venueName.includes(venueKeyLower)) continue;
+        const home = (comp.competitors || []).find(c => c.homeAway === "home");
+        const away = (comp.competitors || []).find(c => c.homeAway === "away");
+        const startIso = ev.date || "";
+        const daysAway = Math.max(0, Math.floor((new Date(startIso) - new Date()) / 86400000));
+        out.push({
+          source: `espn_${l}`,
+          league: l.toUpperCase(),
+          venue: venue.key,
+          venueLat: venue.lat,
+          venueLng: venue.lng,
+          distanceKm: +dist.toFixed(2),
+          home: home?.team?.displayName || "",
+          away: away?.team?.displayName || "",
+          startDate: startIso.slice(0,10),
+          startDateTime: startIso,
+          daysAway,
+        });
+      }
+    }
+  }
+  // Dedupe games at multi-league venues (MSG hosts Knicks + Rangers; we don't
+  // want to double-count if an event shows up in both feeds for any reason).
+  const seen = new Set();
+  const deduped = out.filter(e => {
+    const k = `${e.venue}|${e.startDateTime}|${e.home}|${e.away}`;
+    if (seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+  deduped.sort((a,b) => new Date(a.startDateTime) - new Date(b.startDateTime));
+  return deduped;
+}
+
 function parseSignText(text) {
   if (!text) return null;
   const upper = text.toUpperCase();
@@ -1480,6 +1584,18 @@ app.get("/api/events", async (req, res) => {
 
   const results = new Map();
 
+  // NYC bbox detection — only hit NYC-specific Socrata sources when the search
+  // is actually in NYC. Avoids pointless API calls from LA/Chicago/etc.
+  const NYC_BBOX = { minLat: 40.49, maxLat: 40.92, minLng: -74.26, maxLng: -73.69 };
+  const inNYC = lat && lng &&
+    +lat >= NYC_BBOX.minLat && +lat <= NYC_BBOX.maxLat &&
+    +lng >= NYC_BBOX.minLng && +lng <= NYC_BBOX.maxLng;
+  // Borough-only fallback: if we have a borough string matching a NYC borough,
+  // treat it as NYC even without coords (older clients only send borough).
+  const nycBoroughs = ["brooklyn","manhattan","queens","bronx","staten island"];
+  const boroughIsNYC = borough && nycBoroughs.some(b => String(borough).toLowerCase().includes(b));
+  const shouldHitNYCSources = inNYC || boroughIsNYC;
+
   // Chicago Park District: pulls events at Soldier Field / Grant Park /
   // Millennium Park / Maggie Daley when the user's coords are within ~0.5 mi.
   // Surfaces these as event entries with the venue name and parking-impact
@@ -1504,7 +1620,30 @@ app.get("/api/events", async (req, res) => {
     } catch(e) { console.error("Chicago events:", e.message); }
   }
 
-  try {
+  // ESPN sports schedules — NFL / NBA / MLB / NHL home games at major venues
+  // (Soldier Field, Wrigley, United Center, MSG, Yankee/Citi, MetLife, SoFi,
+  // Crypto.com, Dodger Stadium). Only fires when user's coords are within 3 km
+  // of a known venue, so there's no "Lakers game" noise from a Chicago search.
+  if (lat && lng) {
+    try {
+      const sports = await fetchSportsEventsNear(+lat, +lng, 3);
+      for (const ev of sports) {
+        const id = `espn-${ev.league}-${ev.venue}-${ev.startDateTime}`;
+        if (!results.has(id)) results.set(id, {
+          name: `${ev.away} @ ${ev.home}`,
+          type: `${ev.league} @ ${ev.venue}`,
+          start: ev.startDate,
+          end: ev.startDate,
+          location: ev.venue,
+          distance: `${ev.distanceKm} km`,
+          daysAway: ev.daysAway,
+          parkingImpacted: true,
+        });
+      }
+    } catch(e) { console.error("Sports events:", e.message); }
+  }
+
+  if (shouldHitNYCSources) try {
     // Source 1: NYC Special Events (tvpp-9vvx) — parades, street fairs, etc.
     const bf = borough ? `%20AND%20upper(borough)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
     const url1 = `${SOCRATA}/tvpp-9vvx.json?$where=startdate%20>=%20'${today}'%20AND%20startdate%20<=%20'${toDateStr}'${bf}&$limit=30&$order=startdate%20ASC`;
@@ -1526,7 +1665,7 @@ app.get("/api/events", async (req, res) => {
     }
   } catch(e) { console.error("Events source 1:", e.message); }
 
-  try {
+  if (shouldHitNYCSources) try {
     // Source 2: NYC Street Closures (uiay-nctp)
     const bf2 = borough ? `%20AND%20upper(borough_name)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
     const url2 = `${SOCRATA}/uiay-nctp.json?$where=work_start_date%20>=%20'${today}'%20AND%20work_start_date%20<=%20'${toDateStr}'${bf2}&$limit=20&$order=work_start_date%20ASC`;
@@ -1548,7 +1687,7 @@ app.get("/api/events", async (req, res) => {
     }
   } catch(e) { console.error("Events source 2:", e.message); }
 
-  try {
+  if (shouldHitNYCSources) try {
     // Source 3: NYC Parade permits (from special events dataset filtered by type)
     const bf3 = borough ? `%20AND%20upper(borough)%20LIKE%20'%25${encodeURIComponent(borough.toUpperCase())}%25'` : "";
     const url3 = `${SOCRATA}/tvpp-9vvx.json?$where=upper(eventtype)%20LIKE%20'%25PARADE%25'%20AND%20startdate%20>=%20'${today}'${bf3}&$limit=10`;

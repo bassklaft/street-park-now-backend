@@ -1504,7 +1504,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v14:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v15:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   const cached = heatmapCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return res.json(cached.data);
@@ -1530,6 +1530,46 @@ app.get("/api/heatmap", async (req, res) => {
 
     const streetNames = [...new Set(ways.map(w => normStreet(w.tags.name)))].slice(0, 80);
     if (!streetNames.length) return res.json([]);
+
+    // City allowlist: only ask Claude for cleaning schedules where weekly
+    // street-sweeping / alt-side regimes genuinely exist. Outside these
+    // bboxes, streets default to green rather than receiving hallucinated
+    // schedules (Dallas, Austin, Nashville, Atlanta, Denver, Miami, etc.
+    // don't have block-level weekly sweeping; Claude was making it up).
+    // Chicago is handled by its own real-data branch earlier in this function.
+    const CLEANING_CITY_BBOXES = [
+      { name:"NYC",      minLat:40.49, maxLat:40.92, minLng:-74.26, maxLng:-73.69 },
+      { name:"Boston",   minLat:42.20, maxLat:42.45, minLng:-71.20, maxLng:-70.85 },
+      { name:"DC",       minLat:38.80, maxLat:39.00, minLng:-77.15, maxLng:-76.90 },
+      { name:"Philly",   minLat:39.87, maxLat:40.14, minLng:-75.28, maxLng:-74.96 },
+      { name:"SF",       minLat:37.70, maxLat:37.83, minLng:-122.52,maxLng:-122.35 },
+      { name:"LA",       minLat:33.70, maxLat:34.35, minLng:-118.65,maxLng:-118.15 },
+      { name:"Seattle",  minLat:47.45, maxLat:47.73, minLng:-122.46,maxLng:-122.22 },
+      { name:"Portland", minLat:45.43, maxLat:45.65, minLng:-122.81,maxLng:-122.44 },
+      { name:"Baltimore",minLat:39.20, maxLat:39.38, minLng:-76.72, maxLng:-76.52 },
+      { name:"Toronto",  minLat:43.58, maxLat:43.86, minLng:-79.64, maxLng:-79.11 },
+    ];
+    const cleaningCity = CLEANING_CITY_BBOXES.find(b =>
+      +lat >= b.minLat && +lat <= b.maxLat && +lng >= b.minLng && +lng <= b.maxLng
+    );
+    if (!cleaningCity) {
+      // Default all streets to green — honest "no known scheduled rule."
+      const result = ways.map(w => ({
+        street: normStreet(w.tags.name),
+        coords: w.geometry.map(p => [p.lat, p.lon]),
+        urgency: "green",
+        nextClean: null,
+      }));
+      heatmapCache.set(cacheKey, { data: result, ts: Date.now() });
+      try {
+        await db.query(
+          `INSERT INTO heatmap_cache (cache_key, data) VALUES ($1, $2) ON CONFLICT (cache_key) DO UPDATE SET data=$2, updated_at=NOW()`,
+          [cacheKey, JSON.stringify(result)]
+        );
+      } catch(e) {}
+      console.log(`Heatmap (outside cleaning-city allowlist): ${result.length} streets → all green`);
+      return res.json(result);
+    }
 
     // Chicago branch: use real city data (zone polygons + scheduled dates)
     // instead of asking Claude. Every residential way that falls inside a

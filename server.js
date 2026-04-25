@@ -1362,7 +1362,15 @@ function cleanSignText(desc) {
 // Extract the weekday set encoded in a sign description. NYC sign text uses
 // compact forms like "8AM-7PM MON THRU FRI", "MON & THU", "EXCEPT SUN", etc.
 // Returns an array of 3-letter day abbreviations, or null if no days detected.
-const DAY_TOKENS = { MON:"Mon", TUE:"Tue", TUES:"Tue", WED:"Wed", THU:"Thu", THUR:"Thu", THURS:"Thu", FRI:"Fri", SAT:"Sat", SUN:"Sun" };
+const DAY_TOKENS = {
+  MON:"Mon", MONDAY:"Mon",
+  TUE:"Tue", TUES:"Tue", TUESDAY:"Tue",
+  WED:"Wed", WEDS:"Wed", WEDNESDAY:"Wed",
+  THU:"Thu", THUR:"Thu", THURS:"Thu", THURSDAY:"Thu",
+  FRI:"Fri", FRIDAY:"Fri",
+  SAT:"Sat", SATURDAY:"Sat",
+  SUN:"Sun", SUNDAY:"Sun",
+};
 const DAYS_WEEK = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 function extractSignDays(desc) {
   const u = (desc || "").toUpperCase();
@@ -1374,8 +1382,9 @@ function extractSignDays(desc) {
   if (/\bWEEKENDS?\b/.test(u)) {
     return ["Sat","Sun"];
   }
-  // "MON THRU FRI" / "MON-FRI" ranges
-  const rangeMatch = u.match(/\b(MON|TUE|TUES|WED|THU|THUR|THURS|FRI|SAT|SUN)\s*(?:THRU|THROUGH|TO|-|&|AND)\s*(MON|TUE|TUES|WED|THU|THUR|THURS|FRI|SAT|SUN)\b/);
+  // "MON THRU FRI" / "MON-FRI" / "MONDAY THROUGH FRIDAY" ranges
+  const DAY_RE = "MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY|MON|TUES|TUE|WEDS|WED|THURS|THUR|THU|FRI|SAT|SUN";
+  const rangeMatch = u.match(new RegExp(`\\b(${DAY_RE})\\s*(?:THRU|THROUGH|TO|-|&|AND)\\s*(${DAY_RE})\\b`));
   const days = new Set();
   if (rangeMatch) {
     const startIdx = DAYS_WEEK.indexOf(DAY_TOKENS[rangeMatch[1]]);
@@ -1395,8 +1404,8 @@ function extractSignDays(desc) {
   for (const [token, abbr] of Object.entries(DAY_TOKENS)) {
     if (new RegExp(`\\b${token}\\b`).test(u)) days.add(abbr);
   }
-  // "EXCEPT SUN" — invert
-  const exceptMatch = u.match(/\bEXCEPT\s+(MON|TUE|TUES|WED|THU|THUR|THURS|FRI|SAT|SUN)\b/);
+  // "EXCEPT SUN" / "EXCEPT SUNDAY" — invert
+  const exceptMatch = u.match(new RegExp(`\\bEXCEPT\\s+(${DAY_RE})\\b`));
   if (exceptMatch && !days.size) {
     const excluded = DAY_TOKENS[exceptMatch[1]];
     for (const d of DAYS_WEEK) if (d !== excluded) days.add(d);

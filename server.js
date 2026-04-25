@@ -1116,6 +1116,93 @@ app.get("/api/cleaning-batch", async (req, res) => {
     } catch (e) { console.error("Chicago cleaning-batch error:", e.message); }
   }
 
+  // NYC short-circuit: pull cleaning signs straight from nfid-uabd (DOT)
+  // for every requested street. This is ground truth — the same dataset
+  // the heatmap uses — and avoids Claude returning empty for less famous
+  // streets like Richardson or Java.
+  const NYC_BBOX = { minLat:40.49, maxLat:40.92, minLng:-74.26, maxLng:-73.69 };
+  const inNYC = lat && lng && +lat >= NYC_BBOX.minLat && +lat <= NYC_BBOX.maxLat &&
+                +lng >= NYC_BBOX.minLng && +lng <= NYC_BBOX.maxLng;
+  if (inNYC) {
+    try {
+      const NYC_BOROUGH_CENTROIDS = {
+        "Manhattan":[40.7831,-73.9712], "Brooklyn":[40.6782,-73.9442],
+        "Queens":[40.7282,-73.7949], "Bronx":[40.8448,-73.8648],
+        "Staten Island":[40.5795,-74.1502],
+      };
+      let nycBorough = null, bestDist = Infinity;
+      for (const [name,[blat,blng]] of Object.entries(NYC_BOROUGH_CENTROIDS)) {
+        const d = haversineKm(+lat,+lng,blat,blng);
+        if (d < bestDist) { bestDist = d; nycBorough = name; }
+      }
+      if (nycBorough) {
+        const aliasToCanon = new Map();
+        for (const s of streets) {
+          const canon = normStreet(s) || s.toUpperCase();
+          for (const alias of streetAliases(canon)) if (!aliasToCanon.has(alias)) aliasToCanon.set(alias, s);
+        }
+        const aliasList = [...aliasToCanon.keys()];
+        const namePredicates = aliasList
+          .map(a => `upper(on_street) LIKE '%${a.replace(/'/g,"''")}%'`)
+          .join(" OR ");
+        const where = `record_type='Current' AND borough='${nycBorough}' AND (${namePredicates})`;
+        const url = `https://data.cityofnewyork.us/resource/nfid-uabd.json?$where=${encodeURIComponent(where)}&$select=on_street,side_of_street,sign_description&$limit=10000`;
+        const r = await fetch(url);
+        if (r.ok) {
+          const rows = await r.json();
+          const result = {};
+          for (const s of streets) result[s] = [];
+          const seen = new Map();
+          const FULL_DAY = { Mon:"Monday", Tue:"Tuesday", Wed:"Wednesday", Thu:"Thursday", Fri:"Friday", Sat:"Saturday", Sun:"Sunday" };
+          for (const row of rows) {
+            if (!/STREET CLEANING|BROOM|SANITATION/i.test(row.sign_description || "")) continue;
+            const onStreet = String(row.on_street || "").toUpperCase().trim();
+            let match = aliasToCanon.get(onStreet) || null;
+            if (!match) {
+              for (const [alias, canon] of aliasToCanon) {
+                if (onStreet === alias || onStreet.includes(alias) || alias.includes(onStreet)) { match = canon; break; }
+              }
+            }
+            if (!match) continue;
+            const days = extractSignDays(row.sign_description) || [];
+            if (!days.length) continue;
+            const range = extractSignTimeRange(row.sign_description);
+            const time = range
+              ? `${minToLabel(range.startMin)} - ${minToLabel(range.endMin)}`
+              : "";
+            const side = row.side_of_street === "L" ? "Left / Even side"
+                       : row.side_of_street === "R" ? "Right / Odd side"
+                       : (row.side_of_street || "");
+            const key = `${match}|${days.join(",")}|${time}|${side}`;
+            if (seen.has(key)) continue;
+            seen.set(key, true);
+            const cleanedRaw = cleanSignText(row.sign_description).slice(0, 90);
+            const fullDays = days.map(d => FULL_DAY[d] || d);
+            result[match].push({
+              days: fullDays,
+              time,
+              side,
+              raw: cleanedRaw,
+              upcomingDates: getUpcomingDates(days),
+            });
+          }
+          // Sort each street's entries: today/tomorrow first.
+          const todayAbbr = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date().getDay()];
+          for (const s of Object.keys(result)) {
+            result[s].sort((a, b) => {
+              const aHasToday = a.days.some(d => d.startsWith(todayAbbr));
+              const bHasToday = b.days.some(d => d.startsWith(todayAbbr));
+              return (bHasToday ? 1 : 0) - (aHasToday ? 1 : 0);
+            });
+          }
+          const populated = Object.values(result).filter(v => v.length > 0).length;
+          console.log(`Cleaning-batch NYC DOT: ${populated}/${streets.length} streets matched`);
+          return res.json(result);
+        }
+      }
+    } catch (e) { console.error("NYC DOT cleaning-batch error:", e.message); }
+  }
+
   try {
     const todayISO = new Date().toISOString().slice(0,10);
     const text = await askClaude(`You are a US urban parking expert. Today is ${todayISO}. Return weekly posted parking schedules currently in effect for these streets ${locationCtx}.
@@ -1351,6 +1438,18 @@ function extractSignTimeRange(desc) {
 // Is a sign active right now in the "America/New_York" tz? Considers both
 // the weekday set AND the time-of-day window. Returns true/false/null where
 // null means "sign has no day+time window we can evaluate" (always-active).
+// Format a minutes-from-midnight value back into a human label like
+// "8:30 AM" / "12 AM" — used by /api/cleaning-batch when reconstructing
+// a schedule entry from a parsed time range.
+function minToLabel(min) {
+  if (min == null || isNaN(min)) return "";
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  const ap = h >= 12 ? "PM" : "AM";
+  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return m === 0 ? `${h12} ${ap}` : `${h12}:${String(m).padStart(2,"0")} ${ap}`;
+}
+
 function isSignActiveNow(desc, now = new Date()) {
   const days = extractSignDays(desc);
   const range = extractSignTimeRange(desc);

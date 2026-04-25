@@ -2052,7 +2052,7 @@ app.get("/api/heatmap", async (req, res) => {
   const { lat, lng } = req.query;
   if (!lat || !lng) return res.json([]);
 
-  const cacheKey = `v29:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
+  const cacheKey = `v30:${parseFloat(lat).toFixed(3)},${parseFloat(lng).toFixed(3)}`;
 
   // Stale-while-revalidate: if we have ANY cached entry (fresh or stale),
   // serve it immediately so polylines render the moment the map opens.
